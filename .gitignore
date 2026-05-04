@@ -1,0 +1,24 @@
+# API 키 / 환경변수
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 런타임 생성 파일
+plan.json
+eval.log
+eval_history.json
+build.log
+feature_priority.json
+
+# 생성된 wiki (결과물)
+wiki/
+
+# 3GPP 스펙 원본 (별도 입수)
+sources/
+
+# 에디터
+.obsidian/
+.claude/
