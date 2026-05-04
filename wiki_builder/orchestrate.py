@@ -739,15 +739,37 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                 return f"generate_features 완료: {succeeded}개 생성, {len(failed_list)}개 실패"
 
             elif name == "run_lint":
-                from wiki_builder.lint import run_lint
+                from wiki_builder.lint import run_lint, run_post_lint
                 report = run_lint(wiki_dir=str(WIKI_DIR), call_llm=ctx["call_llm"])
-                return (
+
+                plan = _load_plan()
+                if plan:
+                    post = run_post_lint(
+                        report=report,
+                        plan=plan,
+                        plan_path=str(PLAN_PATH),
+                    )
+                    if post["needs_generate"]:
+                        execute_tool("run_generate", {})
+                    if post["needs_link"]:
+                        execute_tool("run_link", {})
+                else:
+                    logger.warning("plan.json 없음 — post-lint 후속 조치 스킵")
+                    post = {}
+
+                summary = (
                     f"Lint 완료 — "
                     f"고아:{len(report.get('orphan_pages', []))} "
                     f"깨진링크:{len(report.get('broken_links', []))} "
                     f"모순:{len(report.get('contradictions', []))} "
                     f"공백:{len(report.get('data_gaps', []))}"
                 )
+                added = len(post.get("added_pages", []))
+                reset = len(post.get("reset_pages", []))
+                relink = len(post.get("relink_pages", []))
+                if added or reset or relink:
+                    summary += f" | 후속: 추가={added} 재생성={reset} 재링크={relink}"
+                return summary
 
             elif name == "run_chat":
                 from wiki_builder.chat import run_chat

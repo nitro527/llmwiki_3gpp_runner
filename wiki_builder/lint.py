@@ -47,7 +47,7 @@ def run_lint(wiki_dir: str, call_llm) -> dict:
     # ── Python 직접 계산 ──
     link_map = _build_link_map(pages, wiki_path)
     orphan_pages = _find_orphans(pages, link_map)
-    missing_backlinks = _find_missing_backlinks(pages, link_map, wiki_path)
+    missing_backlinks = _find_missing_backlinks(pages, link_map)
     broken_links = _find_broken_links(pages, wiki_path)
 
     logger.info(f"고아 페이지: {len(orphan_pages)}개, 역링크 누락: {len(missing_backlinks)}개, "
@@ -129,7 +129,7 @@ def _find_orphans(pages: list[str], link_map: dict) -> list[str]:
             if count == 0 and not p.startswith("query/")]
 
 
-def _find_missing_backlinks(pages: list[str], link_map: dict, wiki_path: Path) -> list[dict]:
+def _find_missing_backlinks(pages: list[str], link_map: dict) -> list[dict]:
     """A→B 링크가 있는데 B→A 역링크가 없는 경우."""
     missing = []
     for page_a, linked in link_map.items():
@@ -192,55 +192,60 @@ def _save_report(report: dict, wiki_path: Path) -> str:
     today = date.today().strftime("%Y-%m-%d")
     report_path = wiki_path / f"lint_{today}.md"
 
-    lines = [f"# Lint 리포트 — {today}\n"]
+    sections = [f"# Lint 리포트 — {today}\n"]
 
-    lines.append(f"## 요약\n")
-    lines.append(f"| 항목 | 건수 |\n|------|------|\n")
-    lines.append(f"| 고아 페이지 | {len(report['orphan_pages'])} |\n")
-    lines.append(f"| 역방향 링크 누락 | {len(report['missing_backlinks'])} |\n")
-    lines.append(f"| 깨진 링크 | {len(report['broken_links'])} |\n")
-    lines.append(f"| 내용 모순 | {len(report['contradictions'])} |\n")
-    lines.append(f"| 오래된 주장 | {len(report['stale_claims'])} |\n")
-    lines.append(f"| 데이터 공백 | {len(report['data_gaps'])} |\n\n")
+    # 요약 표
+    counts = {
+        "고아 페이지":       len(report["orphan_pages"]),
+        "역방향 링크 누락":  len(report["missing_backlinks"]),
+        "깨진 링크":         len(report["broken_links"]),
+        "내용 모순":         len(report["contradictions"]),
+        "오래된 주장":       len(report["stale_claims"]),
+        "데이터 공백":       len(report["data_gaps"]),
+    }
+    rows = "\n".join(f"| {label} | {cnt} |" for label, cnt in counts.items())
+    sections.append(f"\n## 요약\n| 항목 | 건수 |\n|------|------|\n{rows}\n")
 
     if report["orphan_pages"]:
-        lines.append("## 고아 페이지 (inbound 링크 없음)\n")
-        for p in report["orphan_pages"]:
-            lines.append(f"- {p}\n")
-        lines.append("\n")
+        items = "\n".join(f"- {p}" for p in report["orphan_pages"])
+        sections.append(f"\n## 고아 페이지 (inbound 링크 없음)\n{items}\n")
 
     if report["broken_links"]:
-        lines.append("## 깨진 링크\n")
-        for item in report["broken_links"]:
-            lines.append(f"- `{item['page']}` → [[{item['link']}]] (파일 없음)\n")
-        lines.append("\n")
+        items = "\n".join(
+            f"- `{item['page']}` → [[{item['link']}]] (파일 없음)"
+            for item in report["broken_links"]
+        )
+        sections.append(f"\n## 깨진 링크\n{items}\n")
 
     if report["missing_backlinks"]:
-        lines.append("## 역방향 링크 누락\n")
-        for item in report["missing_backlinks"]:
-            lines.append(f"- `{item['page']}`에 `{item['missing_from']}` 역링크 없음\n")
-        lines.append("\n")
+        items = "\n".join(
+            f"- `{item['page']}`에 `{item['missing_from']}` 역링크 없음"
+            for item in report["missing_backlinks"]
+        )
+        sections.append(f"\n## 역방향 링크 누락\n{items}\n")
 
     if report["contradictions"]:
-        lines.append("## 내용 모순\n")
-        for item in report["contradictions"]:
-            pages = ", ".join(item.get("pages", []))
-            lines.append(f"- [{pages}] {item.get('issue', '')}\n")
-        lines.append("\n")
+        items = "\n".join(
+            f"- [{', '.join(item.get('pages', []))}] {item.get('issue', '')}"
+            for item in report["contradictions"]
+        )
+        sections.append(f"\n## 내용 모순\n{items}\n")
 
     if report["stale_claims"]:
-        lines.append("## 오래된 주장\n")
-        for item in report["stale_claims"]:
-            lines.append(f"- `{item.get('page', '')}`: {item.get('issue', '')}\n")
-        lines.append("\n")
+        items = "\n".join(
+            f"- `{item.get('page', '')}`: {item.get('issue', '')}"
+            for item in report["stale_claims"]
+        )
+        sections.append(f"\n## 오래된 주장\n{items}\n")
 
     if report["data_gaps"]:
-        lines.append("## 데이터 공백 (조사 권장)\n")
-        for item in report["data_gaps"]:
-            lines.append(f"- **{item.get('topic', '')}**: {item.get('suggestion', '')}\n")
-        lines.append("\n")
+        items = "\n".join(
+            f"- **{item.get('topic', '')}**: {item.get('suggestion', '')}"
+            for item in report["data_gaps"]
+        )
+        sections.append(f"\n## 데이터 공백 (조사 권장)\n{items}\n")
 
-    report_path.write_text("".join(lines), encoding="utf-8")
+    report_path.write_text("\n".join(sections), encoding="utf-8")
     return str(report_path.relative_to(wiki_path))
 
 
@@ -250,3 +255,255 @@ def _append_log(wiki_path: Path, entry: str) -> None:
     line = f"## [{today}] {entry}\n"
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(line)
+
+
+# ──────────────────────────────────────────────
+# Post-Lint: 이슈별 후속 조치
+# ──────────────────────────────────────────────
+
+def run_post_lint(
+    report: dict,
+    plan: dict,
+    plan_path: str,
+) -> dict:
+    """
+    Lint 리포트를 사용자에게 출력하고, 이슈별로 후속 조치를 수행할지 확인.
+
+    Returns:
+        {
+            "needs_generate": bool,
+            "needs_link": bool,
+            "added_pages": [str],    # plan에 신규 추가된 페이지 경로
+            "reset_pages": [str],    # generated=False 리셋된 페이지
+            "relink_pages": [str],   # linked=False 리셋된 페이지
+        }
+    """
+    result = {
+        "needs_generate": False,
+        "needs_link": False,
+        "added_pages": [],
+        "reset_pages": [],
+        "relink_pages": [],
+    }
+
+    _print_report_summary(report)
+
+    _handle_broken_links(report.get("broken_links", []), plan, plan_path, result)
+    _handle_missing_backlinks(report.get("missing_backlinks", []), plan, plan_path, result)
+    _handle_contradictions(report.get("contradictions", []), plan, plan_path, result)
+    _print_info_items(report.get("orphan_pages", []), report.get("stale_claims", []))
+
+    print(f"\n{'='*60}")
+    _print_action_summary(result)
+
+    return result
+
+
+def _handle_broken_links(
+    broken: list[dict],
+    plan: dict,
+    plan_path: str,
+    result: dict,
+) -> None:
+    """깨진 링크 이슈 처리: 신규 페이지를 plan에 추가할지 사용자에게 확인."""
+    if not broken:
+        return
+
+    print(f"\n{'='*60}")
+    print(f"[1/3] 깨진 링크 {len(broken)}개 — 대상 파일이 없습니다.")
+    existing_paths = {p["path"] for p in plan.get("pages", [])}
+    candidates = _collect_broken_candidates(broken, existing_paths)
+
+    if not candidates:
+        print("  (추가할 신규 페이지 없음 — 이미 plan에 있거나 중복)")
+        return
+
+    for c in candidates:
+        print(f"  + {c['path']}  (링크 출처: {c['from_page']})")
+
+    if not _ask_user(f"\n이 {len(candidates)}개 페이지를 plan에 추가하고 생성하시겠습니까?\n  [y/N]: "):
+        print("  → 스킵.")
+        return
+
+    for c in candidates:
+        plan["pages"].append({
+            "path": c["path"],
+            "description": c["description"],
+            "generated": False,
+            "linked": False,
+            "sources": [],
+        })
+        result["added_pages"].append(c["path"])
+    _save_plan(plan, plan_path)
+    result["needs_generate"] = True
+    result["needs_link"] = True
+    print(f"  → {len(candidates)}개 plan에 추가됨.")
+
+
+def _handle_missing_backlinks(
+    backlinks: list[dict],
+    plan: dict,
+    plan_path: str,
+    result: dict,
+) -> None:
+    """역방향 링크 누락 처리: 해당 페이지의 linked 플래그를 리셋할지 확인."""
+    if not backlinks:
+        return
+
+    print(f"\n{'='*60}")
+    print(f"[2/3] 역방향 링크 누락 {len(backlinks)}개")
+    pages_to_relink = list({item["page"] for item in backlinks})
+    for p in pages_to_relink[:10]:
+        print(f"  - {p}")
+    if len(pages_to_relink) > 10:
+        print(f"  ... 외 {len(pages_to_relink)-10}개")
+
+    if not _ask_user(
+        f"\n이 {len(pages_to_relink)}개 페이지의 linked 플래그를 리셋하고 링크 단계를 재실행하시겠습니까?\n  [y/N]: "
+    ):
+        print("  → 스킵.")
+        return
+
+    relink_set = set(pages_to_relink)
+    for page in plan.get("pages", []):
+        if page["path"] in relink_set:
+            page["linked"] = False
+            result["relink_pages"].append(page["path"])
+    _save_plan(plan, plan_path)
+    result["needs_link"] = True
+    print(f"  → {len(result['relink_pages'])}개 linked 리셋됨.")
+
+
+def _handle_contradictions(
+    contradictions: list[dict],
+    plan: dict,
+    plan_path: str,
+    result: dict,
+) -> None:
+    """내용 모순 처리: 해당 페이지를 재생성(generated 리셋)할지 확인."""
+    if not contradictions:
+        return
+
+    print(f"\n{'='*60}")
+    print(f"[3/3] 내용 모순 {len(contradictions)}개")
+
+    # 모순 관련 페이지 목록 (중복 제거, 순서 유지)
+    seen: set[str] = set()
+    contra_pages: list[str] = []
+    for item in contradictions:
+        for p in item.get("pages", []):
+            if p not in seen:
+                seen.add(p)
+                contra_pages.append(p)
+
+    for p in contra_pages:
+        print(f"  - {p}")
+        for item in contradictions:
+            if p in item.get("pages", []):
+                print(f"      모순: {item.get('issue', '')}")
+                break
+
+    if not _ask_user(
+        f"\n이 {len(contra_pages)}개 페이지를 재생성하시겠습니까? (generated 플래그 리셋)\n  [y/N]: "
+    ):
+        print("  → 스킵.")
+        return
+
+    contra_set = set(contra_pages)
+    for page in plan.get("pages", []):
+        if page["path"] in contra_set:
+            page["generated"] = False
+            page["linked"] = False
+            result["reset_pages"].append(page["path"])
+    _save_plan(plan, plan_path)
+    result["needs_generate"] = True
+    result["needs_link"] = True
+    print(f"  → {len(result['reset_pages'])}개 재생성 대기 등록됨.")
+
+
+def _print_info_items(orphans: list[str], stale: list[dict]) -> None:
+    """고아 페이지 / 오래된 주장 — 사용자에게 보고만, 조치 없음."""
+    if orphans:
+        print(f"\n{'='*60}")
+        print(f"[참고] 고아 페이지 {len(orphans)}개 (inbound 링크 없음 — 수동 확인 권장)")
+        for p in orphans[:5]:
+            print(f"  - {p}")
+        if len(orphans) > 5:
+            print(f"  ... 외 {len(orphans)-5}개")
+
+    if stale:
+        print(f"\n[참고] 오래된 주장 {len(stale)}개 (수동 검토 권장)")
+        for item in stale[:3]:
+            print(f"  - {item.get('page','')}: {item.get('issue','')}")
+        if len(stale) > 3:
+            print(f"  ... 외 {len(stale)-3}개")
+
+
+def _collect_broken_candidates(
+    broken: list[dict],
+    existing_paths: set,
+) -> list[dict]:
+    """깨진 링크에서 plan에 추가할 신규 페이지 후보 수집."""
+    seen = set()
+    candidates = []
+    for item in broken:
+        stem = item["link"].strip()
+        path = _infer_path(stem, existing_paths)
+        if path in existing_paths or path in seen:
+            continue
+        seen.add(path)
+        candidates.append({
+            "path": path,
+            "description": f"{stem} (링크에서 자동 추가됨)",
+            "from_page": item["page"],
+        })
+    return candidates
+
+
+def _infer_path(stem: str, existing_paths: set) -> str:
+    """링크 이름 → wiki 파일 경로 추론. 대문자 약어 → entities/, 그 외 → concepts/."""
+    clean = stem.replace("-", "").replace("_", "")
+    if clean.isupper() and len(clean) >= 2:
+        return f"entities/{stem}.md"
+    return f"concepts/{stem}.md"
+
+
+def _ask_user(prompt: str) -> bool:
+    """프롬프트를 출력하고 y/N 입력을 받아 bool 반환. 비대화형 환경에서는 False."""
+    try:
+        return input(prompt).strip().lower() == "y"
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _save_plan(plan: dict, plan_path: str) -> None:
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=2)
+
+
+def _print_report_summary(report: dict) -> None:
+    print(f"\n{'='*60}")
+    print("[Lint 결과 요약]")
+    print(f"  고아 페이지         : {len(report.get('orphan_pages', []))}개")
+    print(f"  깨진 링크           : {len(report.get('broken_links', []))}개")
+    print(f"  역방향 링크 누락    : {len(report.get('missing_backlinks', []))}개")
+    print(f"  내용 모순           : {len(report.get('contradictions', []))}개")
+    print(f"  오래된 주장         : {len(report.get('stale_claims', []))}개")
+    print(f"  데이터 공백         : {len(report.get('data_gaps', []))}개")
+    print(f"{'='*60}")
+
+
+def _print_action_summary(result: dict) -> None:
+    print("[후속 조치 요약]")
+    if result["added_pages"]:
+        print(f"  신규 페이지 추가  : {len(result['added_pages'])}개")
+    if result["reset_pages"]:
+        print(f"  재생성 예약       : {len(result['reset_pages'])}개")
+    if result["relink_pages"]:
+        print(f"  재링크 예약       : {len(result['relink_pages'])}개")
+    if not any([result["added_pages"], result["reset_pages"], result["relink_pages"]]):
+        print("  조치 없음.")
+    if result["needs_generate"]:
+        print("  → run_generate 실행 예정")
+    if result["needs_link"]:
+        print("  → run_link 실행 예정")
