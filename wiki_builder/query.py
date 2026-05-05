@@ -13,10 +13,10 @@ import re
 from datetime import date
 from pathlib import Path
 
-from wiki_builder.prompts import (
-    QUERY_SELECTOR_SYSTEM, QUERY_SELECTOR_USER,
-    QUERY_SYNTHESIZER_SYSTEM, QUERY_SYNTHESIZER_USER,
-)
+from wiki_builder.prompt_loader import load_prompt
+
+QUERY_SELECTOR_SYSTEM, QUERY_SELECTOR_USER = load_prompt("query_selector")
+QUERY_SYNTHESIZER_SYSTEM, QUERY_SYNTHESIZER_USER = load_prompt("query_synthesizer")
 
 logger = logging.getLogger(__name__)
 

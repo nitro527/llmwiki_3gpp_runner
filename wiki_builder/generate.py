@@ -36,14 +36,17 @@ def run_generate(
     Returns:
         failed_pages: 품질 불합격 페이지 목록
     """
-    from wiki_builder.prompts import GENERATOR_SYSTEM, GENERATOR_USER
+    from wiki_builder.prompt_loader import load_prompt
+    GENERATOR_SYSTEM, GENERATOR_USER = load_prompt("generator")
 
     pages = plan.get("pages", [])
     todo = [p for p in pages if not p.get("generated", False) and not p["path"].startswith("features/")]
     logger.info(f"Generate 대상: {len(todo)}개 (전체 {len(pages)}개)")
 
     # 전체 wiki path 목록 (링크 참조용)
-    wiki_page_list = "\n".join(p["path"] for p in pages)
+    wiki_page_list = "\n".join(
+        p["path"] + ": " + p.get("description", "") for p in pages
+    )
 
     failed: list[dict] = []
 
@@ -125,7 +128,8 @@ def _generate_page(
     feature_list: list | None = None,
 ) -> dict:
     """단일 페이지 생성 (LLM 독립 호출)."""
-    from wiki_builder.prompts import GENERATOR_SYSTEM, GENERATOR_USER
+    from wiki_builder.prompt_loader import load_prompt
+    GENERATOR_SYSTEM, GENERATOR_USER = load_prompt("generator")
 
     path = page["path"]
     logger.info(f"  생성 중: {path}")

@@ -38,7 +38,8 @@ def run_plan(
     Returns:
         plan dict {"planned_sources": [...], "pages": [...]}
     """
-    from wiki_builder.prompts import PLANNER_SYSTEM, PLANNER_USER
+    from wiki_builder.prompt_loader import load_prompt
+    PLANNER_SYSTEM, PLANNER_USER = load_prompt("planner")
 
     # 소스 파일 수집 (.docx, .txt)
     source_files = _collect_sources(sources_dir)
@@ -132,7 +133,8 @@ def _plan_chunk(
     backend: str,
 ) -> list[dict]:
     """청크 하나에서 LLM으로 페이지 목록 추출."""
-    from wiki_builder.prompts import PLANNER_SYSTEM, PLANNER_USER
+    from wiki_builder.prompt_loader import load_prompt
+    PLANNER_SYSTEM, PLANNER_USER = load_prompt("planner")
 
     if existing_pages_info:
         existing_list = "\n".join(

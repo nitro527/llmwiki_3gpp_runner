@@ -108,7 +108,8 @@ def _check_duplicate_sections(pages: list) -> list:
 
 def _check_semantic_mismatch(pages: list, call_llm, backend: str) -> list:
     """LLM으로 페이지별 의미적 불일치 감지."""
-    from wiki_builder.prompts import POST_PLAN_SYSTEM, POST_PLAN_USER
+    from wiki_builder.prompt_loader import load_prompt
+    POST_PLAN_SYSTEM, POST_PLAN_USER = load_prompt("post_plan")
 
     all_fixes = []
     total_batches = (len(pages) + BATCH_SIZE - 1) // BATCH_SIZE

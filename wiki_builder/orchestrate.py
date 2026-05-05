@@ -209,37 +209,8 @@ TOOL_DEFINITIONS = [
 
 
 def _build_orchestrator_system() -> str:
-    return """\
-당신은 LLMWiki 파이프라인 오케스트레이터입니다.
-사용자의 지시나 질문에 따라 적절한 tool을 호출합니다.
-
-## 파이프라인 순서
-전체 빌드(all):
-  run_plan → run_post_plan → run_generate → run_evaluate → run_link
-  → run_plan_features → run_generate_features → run_link → run_lint
-
-주의: run_evaluate는 반드시 run_link 이전에 실행 (evaluate 재생성 시 link 초기화됨)
-주의: run_link는 run_generate_features 완료 후 한 번 더 실행 (features/ 링크 반영)
-
-## Lint 후 피드백 루프
-run_lint 결과에 data_gaps(누락 페이지 제안)가 있으면:
-1. run_plan 호출 (증분 — 새 소스에서 누락 페이지 추가)
-2. run_generate 호출 (새 페이지만 생성)
-3. run_link 호출 (새 페이지 링크 보완)
-4. run_lint 재실행 (검증)
-판단은 당신이 합니다 — data_gaps가 중요하다고 판단될 때만 피드백 루프 진행.
-
-## 질문 처리
-- 기술 질문, 개념 설명, 절차 조회 → run_query 호출
-- wiki가 없거나 부족할 때는 솔직하게 알려주세요.
-
-## 중요 규칙
-- 이미 완료된 단계는 각 run_* 함수가 내부적으로 스킵합니다 (멱등성 보장).
-- run_chat, run_server는 블로킹이므로 사용자가 명시적으로 요청할 때만 호출하세요.
-- 오류가 발생해도 가능한 다음 단계를 계속 진행하세요.
-- tool 실행 결과를 바탕으로 진행 상황을 간결하게 보고하세요.
-- 모든 단계가 완료되면 최종 결과를 요약하고 end_turn으로 종료합니다.
-"""
+    agents_md = Path(__file__).parent.parent / "AGENTS.md"
+    return agents_md.read_text(encoding="utf-8")
 
 
 def _build_user_message(args) -> str:
@@ -612,7 +583,8 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
 
             elif name == "run_plan_features":
                 from wiki_builder.parse_38822 import build_feature_groups
-                from wiki_builder.prompts import FEATURE_GENERATOR_USER
+                from wiki_builder.prompt_loader import load_prompt
+                _FEATURE_GENERATOR_SYSTEM, FEATURE_GENERATOR_USER = load_prompt("feature_generator")
                 import json as _json
 
                 releases = tool_input.get("releases", [15, 16])
@@ -674,7 +646,8 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                 wiki_pages = [p["path"] for p in plan["pages"]]
                 wiki_page_list = "\n".join(wiki_pages)
 
-                from wiki_builder.prompts import FEATURE_GENERATOR_SYSTEM, FEATURE_GENERATOR_USER
+                from wiki_builder.prompt_loader import load_prompt
+                FEATURE_GENERATOR_SYSTEM, FEATURE_GENERATOR_USER = load_prompt("feature_generator")
                 max_workers = tool_input.get("max_workers", ctx["max_workers"])
                 succeeded = 0
                 failed_list = []

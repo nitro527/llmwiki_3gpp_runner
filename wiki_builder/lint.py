@@ -12,7 +12,9 @@ import re
 from datetime import date
 from pathlib import Path
 
-from wiki_builder.prompts import LINT_SYSTEM, LINT_USER
+from wiki_builder.prompt_loader import load_prompt
+
+LINT_SYSTEM, LINT_USER = load_prompt("lint")
 
 logger = logging.getLogger(__name__)
 

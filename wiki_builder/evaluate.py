@@ -40,7 +40,8 @@ def check_quality(
     Returns:
         {"score": int, "pass": bool, "issues": list, "details": dict}
     """
-    from wiki_builder.prompts import CHECKER_SYSTEM, CHECKER_USER
+    from wiki_builder.prompt_loader import load_prompt
+    CHECKER_SYSTEM, CHECKER_USER = load_prompt("checker")
 
     quick = _quick_check(content)
 
@@ -162,8 +163,9 @@ def run_evaluate(
     initial_failed: generate phase에서 직접 넘어온 불합격 목록.
                     None이면 generated=True 페이지를 재평가하여 수집.
     """
-    import wiki_builder.prompts as prompts_module
-    from wiki_builder.prompts import EVALUATOR_SYSTEM, EVALUATOR_USER
+    from wiki_builder.prompt_loader import load_prompt
+    EVALUATOR_SYSTEM, EVALUATOR_USER = load_prompt("evaluator")
+    generator_system, generator_user = load_prompt("generator")
 
     pages = plan.get("pages", [])
     history_path = Path(eval_log).parent / "eval_history.json"
@@ -199,13 +201,13 @@ def run_evaluate(
         logger.info(f"Evaluate 라운드 {round_idx + 1}/{MAX_EVAL_ROUNDS}")
 
         # ── Before 스냅샷 ──
-        before_snapshot = _snapshot_pages(failed_pages, prompts_module)
+        before_snapshot = _snapshot_pages(failed_pages, generator_system, generator_user)
 
         failed_summary = _format_failed_summary(failed_pages)
         user_msg = EVALUATOR_USER.format(
             failed_pages=failed_summary,
-            current_prompt=prompts_module.GENERATOR_SYSTEM,
-            current_user_prompt=prompts_module.GENERATOR_USER,
+            current_prompt=generator_system,
+            current_user_prompt=generator_user,
         )
 
         raw = call_llm(EVALUATOR_SYSTEM, user_msg, temperature=0.1, backend=backend, json_format=True)
@@ -421,7 +423,7 @@ class EvalHistory:
 # 내부 헬퍼
 # ──────────────────────────────────────────────
 
-def _snapshot_pages(failed_pages: list[dict], prompts_module) -> dict:
+def _snapshot_pages(failed_pages: list[dict], generator_system: str, generator_user: str) -> dict:
     """Before 스냅샷."""
     return {
         "failed_count": len(failed_pages),
@@ -434,8 +436,8 @@ def _snapshot_pages(failed_pages: list[dict], prompts_module) -> dict:
             for fp in failed_pages
         ],
         "prompt_hashes": {
-            "GENERATOR_SYSTEM": _hash_text(prompts_module.GENERATOR_SYSTEM),
-            "GENERATOR_USER": _hash_text(prompts_module.GENERATOR_USER),
+            "GENERATOR_SYSTEM": _hash_text(generator_system),
+            "GENERATOR_USER": _hash_text(generator_user),
         },
     }
 

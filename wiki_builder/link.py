@@ -22,7 +22,8 @@ def run_link(
     backend: str = "claude",
 ) -> None:
     """Phase 3 실행."""
-    from wiki_builder.prompts import LINKER_SYSTEM, LINKER_USER
+    from wiki_builder.prompt_loader import load_prompt
+    LINKER_SYSTEM, LINKER_USER = load_prompt("linker")
 
     pages = plan.get("pages", [])
     generated = [p for p in pages if p.get("generated", False)]
