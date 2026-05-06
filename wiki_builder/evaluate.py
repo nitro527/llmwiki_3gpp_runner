@@ -19,8 +19,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-PASS_SCORE = 7
+PASS_SCORE = 8
 MAX_EVAL_ROUNDS = 5
+PATCH_CLEANUP_INTERVAL = 5
 
 
 # ──────────────────────────────────────────────
@@ -64,7 +65,7 @@ def check_quality(
         logger.warning(f"Checker 파싱 실패 (시도 {attempt + 1}/3)")
 
     logger.error("Checker LLM 파싱 3회 실패 — 구조 검사 결과 사용")
-    return quick
+    return {**quick, "llm_check_failed": True}
 
 
 def _quick_check(content: str) -> dict:
@@ -135,7 +136,7 @@ def _parse_checker_response(raw: str) -> dict | None:
     score = data.get("score", 0)
     return {
         "score": score,
-        "pass": data.get("pass", score >= PASS_SCORE),
+        "pass": score >= PASS_SCORE,
         "issues": data.get("issues", []),
         "details": data.get("details", {}),
         "method": "llm_check",
@@ -177,7 +178,8 @@ def run_evaluate(
     # - --phase evaluate 단독 실행: generated=True 페이지 재평가
     if initial_failed is not None:
         from_generate = [
-            {"path": fp["path"], "score": fp.get("score"), "issues": fp.get("issues", [])}
+            {"path": fp["path"], "score": fp.get("score"), "issues": fp.get("issues", []),
+             "reason": fp.get("reason", ""), "content": fp.get("content", "")}
             for fp in initial_failed
         ]
         from_existing = _collect_failed_pages(pages, wiki_dir, extract_spec_fn, call_llm, backend)
@@ -213,39 +215,48 @@ def run_evaluate(
         raw = call_llm(EVALUATOR_SYSTEM, user_msg, temperature=0.1, backend=backend, json_format=True)
 
         if raw.startswith("[LLM 호출 실패]"):
-            logger.error(f"Evaluator LLM 실패: {raw}")
-            history.add_round(session, before_snapshot, change={"error": raw}, after=None)
-            history.save()
-            break
+            logger.error(f"Evaluator LLM 실패 (라운드 {round_idx + 1}): {raw} — 다음 라운드 시도")
+            _record_error_round(history, session, before_snapshot, error=raw)
+            continue
 
         analysis = _parse_evaluator_response(raw)
         if analysis is None:
-            logger.error("Evaluator 응답 파싱 실패")
-            history.add_round(session, before_snapshot, change={"error": "파싱 실패"}, after=None)
-            history.save()
-            break
+            logger.error(f"Evaluator 응답 파싱 실패 (라운드 {round_idx + 1}) — 다음 라운드 시도")
+            _record_error_round(history, session, before_snapshot, error="파싱 실패")
+            continue
 
-        # ── 사람 컨펌 대기 ──
         _print_analysis(round_idx + 1, analysis, failed_pages)
-        try:
-            answer = input("계속하려면 [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = "n"
 
         change_record = {
             "root_cause": analysis.get("root_cause", ""),
+            "failure_pattern": analysis.get("failure_pattern", ""),
             "affected_pages": analysis.get("affected_pages", []),
-            "prompt_fix": analysis.get("prompt_fix", {}),
             "confidence": analysis.get("confidence", ""),
-            "user_confirmed": answer == "y",
+            "user_confirmed": True,
         }
 
-        if answer != "y":
-            logger.info("사용자가 재실행 거부 — Evaluate 종료")
-            history.add_round(session, before_snapshot, change=change_record, after=None)
+        if analysis.get("fix_target") != "generator":
+            logger.warning("원인이 checker 문제로 판단됨 — 재생성 없이 사용자에게 보고 후 종료")
+            print("\n[Evaluate] 원인이 generator가 아닌 checker(품질 검사 도구) 문제입니다.")
+            print(f"  root_cause: {analysis.get('root_cause')}")
+            print("  재생성 없이 종료합니다. checker 코드 또는 프롬프트를 검토하세요.")
+            history.add_round(session, before_snapshot, change={**change_record, "skipped": "checker_issue"}, after=None)
             history.save()
             _write_eval_log(eval_log, round_idx + 1, failed_pages, analysis)
             break
+
+        # ── Patcher: failure_pattern → 추가 규칙 생성 → patches.md 적용 ──
+        failure_pattern = analysis.get("failure_pattern", "").strip()
+        if failure_pattern:
+            patch_rule = _call_patcher(failure_pattern, call_llm, backend)
+            if patch_rule:
+                _apply_prompt_fix("GENERATOR_SYSTEM", patch_rule, call_llm=call_llm, backend=backend)
+                generator_system, generator_user = load_prompt("generator")
+                logger.info(f"패치 적용 완료: {patch_rule[:80]}...")
+            else:
+                logger.warning("Patcher LLM 실패 — 프롬프트 미수정 상태로 재생성")
+        else:
+            logger.warning("failure_pattern 없음 — 프롬프트 미수정 상태로 재생성")
 
         # ── 재생성 ──
         failed_paths = {fp["path"] for fp in failed_pages}
@@ -423,6 +434,12 @@ class EvalHistory:
 # 내부 헬퍼
 # ──────────────────────────────────────────────
 
+def _record_error_round(history: "EvalHistory", session: str, before: dict, error: str) -> None:
+    """라운드에서 LLM 실패 또는 파싱 실패 시 기록 후 저장."""
+    history.add_round(session, before, change={"error": error}, after=None)
+    history.save()
+
+
 def _snapshot_pages(failed_pages: list[dict], generator_system: str, generator_user: str) -> dict:
     """Before 스냅샷."""
     return {
@@ -549,11 +566,109 @@ def _collect_failed_pages(
     return failed
 
 
+def analyze_and_patch(failed_pages: list[dict], call_llm, backend: str) -> bool:
+    """
+    mid_eval 전용: 실패 패턴 분석 + 프롬프트 패치만 수행. 재생성 없음.
+    Returns True if patch was applied.
+    """
+    from wiki_builder.prompt_loader import load_prompt
+    EVALUATOR_SYSTEM, EVALUATOR_USER = load_prompt("evaluator")
+    generator_system, generator_user = load_prompt("generator")
+
+    failed_summary = _format_failed_summary(failed_pages)
+    user_msg = EVALUATOR_USER.format(
+        failed_pages=failed_summary,
+        current_prompt=generator_system,
+        current_user_prompt=generator_user,
+    )
+
+    raw = call_llm(EVALUATOR_SYSTEM, user_msg, temperature=0.1, backend=backend, json_format=True)
+    if raw.startswith("[LLM 호출 실패]"):
+        logger.error(f"mid_eval Evaluator LLM 실패: {raw}")
+        return False
+
+    analysis = _parse_evaluator_response(raw)
+    if analysis is None:
+        logger.error("mid_eval Evaluator 응답 파싱 실패")
+        return False
+
+    if analysis.get("fix_target") != "generator":
+        logger.warning(f"mid_eval: fix_target={analysis.get('fix_target')} — 패치 스킵")
+        return False
+
+    failure_pattern = analysis.get("failure_pattern", "").strip()
+    if not failure_pattern:
+        logger.warning("mid_eval: failure_pattern 없음 — 패치 스킵")
+        return False
+
+    patch_rule = _call_patcher(failure_pattern, call_llm, backend)
+    if patch_rule:
+        _apply_prompt_fix("GENERATOR_SYSTEM", patch_rule, call_llm=call_llm, backend=backend)
+        logger.info(f"mid_eval 패치 적용: {patch_rule[:80]}...")
+        return True
+
+    return False
+
+
+def _call_patcher(failure_pattern: str, call_llm, backend: str) -> str:
+    """failure_pattern을 받아 추가할 규칙 1-2문장을 반환."""
+    from wiki_builder.prompt_loader import load_prompt
+    PATCHER_SYSTEM, PATCHER_USER = load_prompt("patcher")
+    user_msg = PATCHER_USER.format(failure_pattern=failure_pattern)
+    raw = call_llm(PATCHER_SYSTEM, user_msg, temperature=0.1, backend=backend)
+    if raw.startswith("[LLM 호출 실패]"):
+        logger.error(f"Patcher LLM 실패: {raw}")
+        return ""
+    return raw.strip()
+
+
+def _apply_prompt_fix(target: str, new_content: str,
+                      call_llm=None, backend: str = "gptoss") -> None:
+    """수정 내용을 generator_patches.md에 누적 (generator.md 원본 불변)."""
+    from wiki_builder.prompt_loader import _SUB_AGENTS_DIR
+    patches_path = _SUB_AGENTS_DIR / "generator_patches.md"
+    existing = patches_path.read_text(encoding="utf-8").strip() if patches_path.exists() else ""
+
+    # 중복 체크: 기존 패치 항목과 정확히 일치하는 것이 있으면 스킵
+    existing_patches = [p.strip() for p in existing.split("---PATCH---")] if existing else []
+    if new_content.strip() in existing_patches:
+        logger.info("동일 패치 이미 존재 — 스킵")
+        return
+
+    separator = "\n\n---PATCH---\n\n"
+    updated = (existing + separator + new_content.strip()) if existing else new_content.strip()
+    patches_path.write_text(updated, encoding="utf-8")
+
+    patch_count = updated.count("---PATCH---") + 1
+    logger.info(f"패치 추가 완료 ({target}), 누적 {patch_count}개")
+    if patch_count >= PATCH_CLEANUP_INTERVAL and call_llm:
+        _cleanup_patches(patches_path, call_llm, backend)
+
+
+def _cleanup_patches(patches_path: Path, call_llm, backend: str) -> None:
+    """누적 패치 중 중복/모순 제거. 크기가 줄어들 때만 저장."""
+    content = patches_path.read_text(encoding="utf-8")
+    system = "프롬프트 엔지니어 역할. 아래 패치 목록에서 중복되거나 모순되는 항목을 제거하고 통합하라. 내용을 약화하거나 삭제하지 말 것. 원문 형식 유지."
+    raw = call_llm(system, content, temperature=0.1, backend=backend)
+    if raw.startswith("[LLM 호출 실패]") or len(raw.strip()) >= len(content):
+        logger.warning("패치 정리 스킵 (LLM 실패 또는 크기 증가)")
+        return
+    patches_path.write_text(raw.strip(), encoding="utf-8")
+    logger.info("패치 정리 완료")
+
+
 def _format_failed_summary(failed_pages: list[dict]) -> str:
     lines = []
     for fp in failed_pages:
-        issues_str = "; ".join(fp.get("issues", []))
-        lines.append(f"- {fp['path']} (점수: {fp.get('score')}) — {issues_str}")
+        reason = fp.get("reason", "")
+        if reason == "hallucination":
+            content_preview = fp.get("content", "")[:2000]
+            lines.append(f"- {fp['path']} — [Hallucination]\n  {content_preview}")
+        elif reason == "llm_check_failed":
+            lines.append(f"- {fp['path']} — [checker LLM 파싱 실패: 내용 평가 불가, 구조 검사만 통과]")
+        else:
+            issues_str = "; ".join(fp.get("issues", []))
+            lines.append(f"- {fp['path']} (점수: {fp.get('score', '?')}) — {issues_str}")
     return "\n".join(lines)
 
 
@@ -578,10 +693,9 @@ def _print_analysis(round_num: int, analysis: dict, failed_pages: list[dict]) ->
     print(f"\n{'='*60}")
     print(f"[Evaluate 라운드 {round_num}] 분석 결과:")
     print(f"  불합격: {len(failed_pages)}개 페이지")
-    print(f"  원인:   {analysis.get('root_cause', 'N/A')}")
-    print(f"  개선 대상 프롬프트: {analysis.get('prompt_fix', {}).get('target', 'N/A')}")
-    print(f"  개선 내용: {analysis.get('prompt_fix', {}).get('change', 'N/A')}")
-    print(f"  신뢰도: {analysis.get('confidence', 'N/A')}")
+    print(f"  원인:         {analysis.get('root_cause', 'N/A')}")
+    print(f"  실패 패턴:    {analysis.get('failure_pattern', 'N/A')}")
+    print(f"  신뢰도:       {analysis.get('confidence', 'N/A')}")
     print()
     for fp in failed_pages:
         print(f"  [{fp.get('score', '?')}/8] {fp['path']}")

@@ -116,7 +116,7 @@ TOOL_DEFINITIONS = [
         "name": "run_evaluate",
         "description": (
             "Phase 4: 품질 불합격 페이지를 분석하고 프롬프트를 개선하여 재생성합니다. "
-            "최대 5라운드. 터미널에서 사람 확인(y/N) 대화가 발생합니다."
+            "Evaluator → Patcher → generator_patches.md 업데이트 → 재생성. 최대 5라운드. 자동 승인."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
@@ -217,7 +217,18 @@ def _build_user_message(args) -> str:
     phase = args.phase
     if phase == "all":
         w = f" (max_workers={args.workers})" if args.workers != 1 else ""
-        return f"전체 wiki 빌드 파이프라인을 실행하세요: plan → generate{w} → link → evaluate → lint (lint 결과에 따라 피드백 루프 판단)"
+        return (
+            f"전체 wiki 빌드 파이프라인을 순서대로 실행하세요:\n"
+            f"1. run_plan\n"
+            f"2. run_post_plan\n"
+            f"3. run_generate{w}\n"
+            f"4. run_evaluate  ← 반드시 run_link 이전\n"
+            f"5. run_link\n"
+            f"6. run_plan_features\n"
+            f"7. run_generate_features\n"
+            f"8. run_link  ← features 링크 반영\n"
+            f"9. run_lint  ← 결과에 따라 피드백 루프 판단"
+        )
     elif phase == "plan":
         return "Phase 1(run_plan)을 실행하세요."
     elif phase == "post_plan":
@@ -285,37 +296,43 @@ def _extract_section(text: str, section_num: str) -> str:
     패턴: \\n{섹션번호}\\t{제목} 로 시작,
     다음 같은 레벨 이상의 헤더까지.
 
-    예: section_num="6.3.1" → \\n6.3.1\\t...부터 \\n6.3.2\\t 또는 \\n6.4\\t 전까지
+    TOC와 실제 섹션 모두 동일 패턴이므로 모든 매치를 찾아
+    내용이 가장 긴 것(실제 섹션)을 반환한다.
     """
     escaped = re.escape(section_num)
     pattern = re.compile(rf'\n{escaped}\t')
     m = pattern.search(text)
     if not m:
+        logger.debug(f"섹션 없음: §{section_num}")
         return ""
 
     start = m.start()
 
-    # 같은 레벨 이상 다음 섹션 찾기
-    # 섹션 레벨: "6.3.1" → depth=3, 다음에 나올 수 있는 헤더는 6.3.x 이상 레벨
-    parts = section_num.split(".")
-    depth = len(parts)
-
-    # 현재 섹션 번호의 상위 prefix (depth-1 레벨까지)
-    # depth=1 → 다음 숫자절, depth=2 → 같은 상위에서 다음 절, etc.
-    if depth == 1:
-        # 다음 최상위 섹션 (\n\d+\t)
-        next_pat = re.compile(r'\n\d+\t')
-    else:
-        parent_prefix = re.escape(".".join(parts[:-1]))
-        # 같은 부모 아래 다음 섹션 또는 상위 섹션
-        next_pat = re.compile(
-            rf'\n(?:{parent_prefix}\.\d+\t|\d+(?:\.\d+){{0,{depth-2}}}\t)'
-        )
+    # 다음 섹션 헤더(레벨 무관)에서 종료 — §6 추출 시 §6.1에서 멈춤
+    next_pat = re.compile(r'\n\d+(?:\.\d+)*\t')
 
     m2 = next_pat.search(text, start + 1)
     end = m2.start() if m2 else len(text)
 
-    return text[start:end].strip()
+    result = text[start:end].strip()
+    logger.debug(f"섹션 추출: §{section_num} ({len(result)}자)")
+    return result
+
+
+def _dedup_sections(sections: list[str]) -> list[str]:
+    """
+    parent 섹션이 있으면 child 섹션 제거.
+    예: ["6", "6.1", "6.1.1"] → ["6"]
+        ["6.1", "6.1.1", "6.2"] → ["6.1", "6.2"]
+    """
+    result = []
+    for sec in sections:
+        # 이미 result에 있는 섹션 중 현재 섹션의 prefix인 것이 있으면 skip
+        if any(sec.startswith(parent + ".") for parent in result):
+            logger.debug(f"섹션 중복 제거: §{sec} (parent 이미 포함)")
+            continue
+        result.append(sec)
+    return result
 
 
 def extract_spec_content(plan_page: dict) -> str:
@@ -353,7 +370,8 @@ def extract_spec_content(plan_page: dict) -> str:
             continue
 
         if sections:
-            for sec in sections:
+            deduped = _dedup_sections(sections)
+            for sec in deduped:
                 extracted = _extract_section(content, sec)
                 if extracted:
                     parts.append(f"[{src_file} §{sec}]\n{extracted}")
@@ -521,19 +539,30 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
 
             elif name == "run_generate":
                 from wiki_builder.generate import run_generate
+                from wiki_builder.evaluate import run_evaluate, check_quality
                 plan = _load_plan()
                 if not plan:
                     return "[오류] plan.json 없음. run_plan을 먼저 실행하세요."
+
+                _backend = ctx["backend"]
+                _call_llm = ctx["call_llm"]
+                _max_workers = tool_input.get("max_workers", ctx["max_workers"])
+
+                def _mid_eval_fn(failed_pages: list) -> None:
+                    from wiki_builder.evaluate import analyze_and_patch
+                    analyze_and_patch(failed_pages, _call_llm, _backend)
+
                 failed = run_generate(
                     plan=plan,
                     wiki_dir=str(WIKI_DIR),
                     plan_path=str(PLAN_PATH),
-                    call_llm=ctx["call_llm"],
+                    call_llm=_call_llm,
                     extract_spec_fn=extract_spec_content,
                     check_quality_fn=check_quality,
-                    backend=ctx["backend"],
-                    max_workers=tool_input.get("max_workers", ctx["max_workers"]),
+                    backend=_backend,
+                    max_workers=_max_workers,
                     feature_list=ctx["feature_list"],
+                    mid_eval_fn=_mid_eval_fn,
                 )
                 ctx["generate_failed"] = failed
                 return f"Generate 완료. 불합격: {len(failed)}개"
@@ -557,6 +586,8 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                 plan = _load_plan()
                 if not plan:
                     return "[오류] plan.json 없음."
+                all_failed = list(ctx.get("generate_failed", []))
+                all_failed += ctx.get("generate_features_failed", [])
                 run_evaluate(
                     plan=plan,
                     wiki_dir=str(WIKI_DIR),
@@ -565,7 +596,7 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                     call_llm=ctx["call_llm"],
                     extract_spec_fn=extract_spec_content,
                     backend=ctx["backend"],
-                    initial_failed=ctx["generate_failed"],
+                    initial_failed=all_failed if all_failed else None,
                 )
                 return "Evaluate 완료"
 
@@ -652,11 +683,21 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                 succeeded = 0
                 failed_list = []
 
-                for page in todo:
+                from wiki_builder.generate import REQUEST_INTERVAL, _detect_hallucination, log_hallucination
+                from wiki_builder.evaluate import check_quality
+                features_failed = []
+
+                for i, page in enumerate(todo):
+                    if i > 0:
+                        import time as _time
+                        _time.sleep(REQUEST_INTERVAL)
+
                     g = page.get("feature_group", {})
                     if not g:
                         logger.warning(f"feature_group 메타데이터 없음: {page['path']}")
                         continue
+
+                    logger.info(f"  생성 중: {page['path']}")
 
                     # Feature 목록 테이블 생성
                     lines = ["| Index | Feature | Field name (TS 38.331) | Rel | Status |",
@@ -670,14 +711,10 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                         )
                     feature_table = "\n".join(lines)
 
-                    # cross-category prereq 요약
                     cross = g.get("cross_category_prereqs", [])
-                    if cross:
-                        cross_summary = "\n".join(
-                            f"- {c['index']}: {c['feature_group']}" for c in cross
-                        )
-                    else:
-                        cross_summary = "(없음)"
+                    cross_summary = "\n".join(
+                        f"- {c['index']}: {c['feature_group']}" for c in cross
+                    ) if cross else "(없음)"
 
                     user_msg = FEATURE_GENERATOR_USER.format(
                         page_name=g["page_name"],
@@ -686,15 +723,48 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                         wiki_page_list=wiki_page_list,
                     )
 
-                    raw = ctx["call_llm"](
-                        FEATURE_GENERATOR_SYSTEM,
-                        user_msg,
-                        temperature=0.3,
-                        backend=ctx["backend"],
-                    )
+                    # 생성 (hallucination 감지 포함, 최대 3회)
+                    raw = None
+                    for attempt in range(3):
+                        resp = ctx["call_llm"](
+                            FEATURE_GENERATOR_SYSTEM,
+                            user_msg,
+                            temperature=0.3,
+                            backend=ctx["backend"],
+                        )
+                        if resp.startswith("[LLM 호출 실패]"):
+                            logger.error(f"Feature LLM 실패: {page['path']}")
+                            break
+                        if _detect_hallucination(resp):
+                            logger.warning(f"Hallucination 감지 ({page['path']}) — 재시도 {attempt+1}/3")
+                            if attempt < 2:
+                                continue
+                            logger.error(f"Hallucination 3회 — 스킵: {page['path']}")
+                            log_hallucination(page["path"], resp)
+                            features_failed.append({
+                                "path": page["path"],
+                                "reason": "hallucination",
+                                "content": resp,
+                            })
+                            break
+                        raw = resp
+                        break
 
-                    if raw.startswith("[LLM 호출 실패]"):
-                        logger.error(f"Feature 생성 실패: {page['path']}")
+                    if not raw:
+                        failed_list.append(page["path"])
+                        continue
+
+                    # 품질 체크
+                    result = check_quality(raw, "", ctx["call_llm"], backend=ctx["backend"])
+                    if not result.get("pass", False):
+                        logger.warning(f"품질 불합격 ({page['path']}) score={result.get('score')}")
+                        features_failed.append({
+                            "path": page["path"],
+                            "reason": "quality_fail",
+                            "score": result.get("score"),
+                            "issues": result.get("issues", []),
+                            "content": raw,
+                        })
                         failed_list.append(page["path"])
                         continue
 
@@ -704,12 +774,17 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
 
                     page["generated"] = True
                     succeeded += 1
-                    logger.info(f"  생성 완료: {page['path']}")
+                    logger.info(f"  생성 완료: {page['path']} (score={result.get('score')})")
 
                 with open(PLAN_PATH, "w", encoding="utf-8") as _f:
                     _json.dump(plan, _f, ensure_ascii=False, indent=2)
 
-                return f"generate_features 완료: {succeeded}개 생성, {len(failed_list)}개 실패"
+                # evaluate 연결용으로 ctx에 저장
+                ctx["generate_features_failed"] = features_failed
+                return (
+                    f"generate_features 완료: {succeeded}개 생성, {len(failed_list)}개 실패"
+                    + (f" — run_evaluate로 불합격 {len(features_failed)}개 분석 가능" if features_failed else "")
+                )
 
             elif name == "run_lint":
                 from wiki_builder.lint import run_lint, run_post_lint
@@ -722,10 +797,7 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                         plan=plan,
                         plan_path=str(PLAN_PATH),
                     )
-                    if post["needs_generate"]:
-                        execute_tool("run_generate", {})
-                    if post["needs_link"]:
-                        execute_tool("run_link", {})
+                    _run_post_lint_followup(post, execute_tool)
                 else:
                     logger.warning("plan.json 없음 — post-lint 후속 조치 스킵")
                     post = {}
@@ -846,6 +918,23 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                     })
     else:
         logger.warning(f"Orchestrator 최대 반복 {MAX_ITERATIONS}회 초과 — 강제 종료")
+
+
+def _run_post_lint_followup(post: dict, execute_tool) -> None:
+    """
+    post-lint 후속 조치 실행.
+    needs_generate와 needs_link는 독립적:
+      - needs_generate가 실패해도 needs_link는 별도 판단.
+      - needs_generate 성공 시에만 needs_link 실행 (생성 결과에 링크가 필요하므로).
+    """
+    generate_ok = True
+    if post.get("needs_generate"):
+        gen_result = execute_tool("run_generate", {})
+        if gen_result.startswith("[오류]"):
+            logger.error(f"post-lint 재생성 실패: {gen_result}")
+            generate_ok = False
+    if post.get("needs_link") and generate_ok:
+        execute_tool("run_link", {})
 
 
 def _load_plan() -> dict | None:

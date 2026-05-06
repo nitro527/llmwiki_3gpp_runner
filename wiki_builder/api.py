@@ -9,7 +9,7 @@ call_simple(system, user, **kwargs) -> str
 컨텍스트 제한 (백엔드별 자동 조정):
     대용량 백엔드 (claude/gemini/gptoss) — 128K tokens 기준:
       MAX_CONTEXT_CHARS  = 300_000  (전체 입력 char 상한)
-      MAX_CONTENT_CHARS  =  80_000  (스펙 내용 등 가변 블록 상한)
+      MAX_CONTENT_CHARS  =  90_000  (스펙 내용 등 가변 블록 상한)
       MAX_CHUNK_CHARS    =  50_000  (청크 1개 상한, chunk_text.py와 동기)
     ollama — 16K tokens 기준 (OLLAMA_CONTEXT 환경변수로 조정 가능):
       MAX_CONTEXT_CHARS  =  30_000  (~13K tokens 여유)
@@ -40,7 +40,7 @@ if BACKEND == "ollama":
     MAX_CHUNK_CHARS   = int(_ollama_ctx_tokens * 2.3 * 0.21)  # ~8K
 else:
     MAX_CONTEXT_CHARS = 300_000   # LLM 1회 호출 전체 입력 char 상한
-    MAX_CONTENT_CHARS =  80_000   # 스펙 내용 등 가변 블록 1개 char 상한
+    MAX_CONTENT_CHARS =  90_000   # 스펙 내용 등 가변 블록 1개 char 상한
     MAX_CHUNK_CHARS   =  50_000   # 청크 1개 char 상한 (chunk_text.py MAX_CHUNK와 동기)
 
 
@@ -199,9 +199,10 @@ def call_simple(system: str, user: str, temperature: float = 0.3, **kwargs) -> s
     # 전체 입력 크기 가드
     total_chars = len(system) + len(user)
     if total_chars > MAX_CONTEXT_CHARS:
-        overflow = total_chars - MAX_CONTEXT_CHARS
-        user = user[:len(user) - overflow]
-        logger.warning(f"입력 총량 초과 — user 메시지 {overflow}자 truncate (backend={backend})")
+        allowed_user_chars = MAX_CONTEXT_CHARS - len(system)
+        trimmed = len(user) - max(0, allowed_user_chars)
+        user = user[:max(0, allowed_user_chars)]
+        logger.warning(f"입력 총량 초과 — user 메시지 {trimmed}자 truncate (backend={backend})")
 
     if backend not in ("claude", "gemini", "gptoss", "ollama"):
         return f"[LLM 호출 실패] 알 수 없는 백엔드: {backend}"
