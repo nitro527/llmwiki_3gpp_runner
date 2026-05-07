@@ -35,3 +35,6 @@ wiki 페이지를 8점 만점으로 평가합니다.
 
 ## 참조 스펙 내용 (hallucination 검증용)
 {spec_content}
+
+## Feature 힌트 (38.822 기반, 선택적 참고)
+{feature_hint}

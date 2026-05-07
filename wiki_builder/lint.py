@@ -312,12 +312,12 @@ def _handle_broken_links(
         return
 
     print(f"\n{'='*60}")
-    print(f"[1/3] 깨진 링크 {len(broken)}개 — 대상 파일이 없습니다.")
+    print(f"[1/3] 깨진 링크 {len(broken)}개 - 대상 파일이 없습니다.")
     existing_paths = {p["path"] for p in plan.get("pages", [])}
     candidates = _collect_broken_candidates(broken, existing_paths)
 
     if not candidates:
-        print("  (추가할 신규 페이지 없음 — 이미 plan에 있거나 중복)")
+        print("  (추가할 신규 페이지 없음 - 이미 plan에 있거나 중복)")
         return
 
     for c in candidates:
@@ -427,7 +427,7 @@ def _print_info_items(orphans: list[str], stale: list[dict]) -> None:
     """고아 페이지 / 오래된 주장 — 사용자에게 보고만, 조치 없음."""
     if orphans:
         print(f"\n{'='*60}")
-        print(f"[참고] 고아 페이지 {len(orphans)}개 (inbound 링크 없음 — 수동 확인 권장)")
+        print(f"[참고] 고아 페이지 {len(orphans)}개 (inbound 링크 없음 - 수동 확인 권장)")
         for p in orphans[:5]:
             print(f"  - {p}")
         if len(orphans) > 5:

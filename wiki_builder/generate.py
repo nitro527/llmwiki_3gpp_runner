@@ -74,32 +74,27 @@ def run_generate(
                         backend=backend,
                         feature_list=feature_list,
                     )
-                    if result.get("failed"):
-                        page["failed_reason"] = result.get("reason", "unknown")
-                        failed.append(result)
-                        _save_plan(plan, plan_path)
-                        if mid_eval_fn and len(failed) >= FAILURE_THRESHOLD:
-                            logger.info(f"실패 {len(failed)}개 누적 — mid_eval 실행 후 전체 재시작")
-                            mid_eval_fn(failed)
-                            failed = []
-                            mid_eval_fired = True
-                            break
-                    else:
-                        page["generated"] = True
-                        page.pop("failed_reason", None)
-                        if result.get("llm_check_failed"):
-                            needs_eval.append({"path": page["path"], "reason": "llm_check_failed"})
-                        _save_plan(plan, plan_path)
+                    mid_eval_fired = _handle_page_result(
+                        result, page, plan, plan_path,
+                        failed, needs_eval, mid_eval_fn,
+                    )
                 except Exception as e:
                     logger.error(f"페이지 생성 예외 ({page['path']}): {e}")
                     page["failed_reason"] = str(e)
                     failed.append({"path": page["path"], "error": str(e)})
                     _save_plan(plan, plan_path)
+                if mid_eval_fired:
+                    break
+
+            if mid_eval_fired:
+                logger.info(f"실패 {len(failed)}개 누적 — mid_eval 실행 후 전체 재시작")
+                mid_eval_fn(failed)
+                failed = []
 
         else:
             # 병렬 처리
-            def _submit(p, exec=None):
-                return (exec or executor).submit(
+            def _submit(p):
+                return executor.submit(
                     _generate_page,
                     page=p,
                     wiki_dir=wiki_dir,
@@ -120,23 +115,17 @@ def run_generate(
                         page = pending.pop(future)
                         try:
                             result = future.result()
-                            if result.get("failed"):
-                                page["failed_reason"] = result.get("reason", "unknown")
-                                failed.append(result)
-                                _save_plan(plan, plan_path)
-                                if mid_eval_fn and len(failed) >= FAILURE_THRESHOLD:
-                                    # 아직 시작 안 한 future 취소 (시작된 것은 완료 대기)
-                                    for f in list(pending.keys()):
-                                        f.cancel()
-                                    pending.clear()
-                                    mid_eval_fired = True
-                                    break
-                            else:
-                                page["generated"] = True
-                                page.pop("failed_reason", None)
-                                if result.get("llm_check_failed"):
-                                    needs_eval.append({"path": page["path"], "reason": "llm_check_failed"})
-                                _save_plan(plan, plan_path)
+                            fired = _handle_page_result(
+                                result, page, plan, plan_path,
+                                failed, needs_eval, mid_eval_fn,
+                            )
+                            if fired:
+                                # 아직 시작 안 한 future 취소 (시작된 것은 완료 대기)
+                                for f in list(pending.keys()):
+                                    f.cancel()
+                                pending.clear()
+                                mid_eval_fired = True
+                                break
                         except Exception as e:
                             logger.error(f"페이지 생성 예외 ({page['path']}): {e}")
                             page["failed_reason"] = str(e)
@@ -246,7 +235,7 @@ def _generate_page(
             return {"path": path, "failed": True, "reason": "생성 실패"}
 
         # 품질 체크
-        result = check_quality_fn(content, spec_content, call_llm, backend=backend)
+        result = check_quality_fn(content, spec_content, call_llm, backend=backend, feature_hint=feature_hint)
         score = result.get("score", 0)
 
         if result.get("pass", False):
@@ -268,15 +257,11 @@ def _generate_page(
             best_content = content
             best_llm_check_failed = result.get("llm_check_failed", False)
 
-    # QUALITY_RETRY_MAX 회 모두 불합격 → 최고 점수 결과로 저장 후 generated 처리
+    # QUALITY_RETRY_MAX 회 모두 불합격 → fail 처리
     logger.warning(
-        f"  품질 기준 미달 {QUALITY_RETRY_MAX}회 — 최고 점수 결과로 저장: {path} (best_score={best_score})"
+        f"  품질 기준 미달 {QUALITY_RETRY_MAX}회 — fail 처리: {path} (best_score={best_score})"
     )
-    out_path = Path(wiki_dir) / path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(best_content)
-    return {"path": path, "failed": False, "llm_check_failed": True}
+    return {"path": path, "failed": True, "reason": f"품질 기준 미달 {QUALITY_RETRY_MAX}회 (best_score={best_score})"}
 
 
 def _detect_hallucination(text: str) -> str | None:
@@ -368,3 +353,36 @@ def log_hallucination(path: str, content: str) -> None:
 def _save_plan(plan: dict, plan_path: str) -> None:
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump(plan, f, ensure_ascii=False, indent=2)
+
+
+def _handle_page_result(
+    result: dict,
+    page: dict,
+    plan: dict,
+    plan_path: str,
+    failed: list,
+    needs_eval: list,
+    mid_eval_fn,
+) -> bool:
+    """
+    단일 페이지 생성 결과를 처리한다.
+
+    - 성공 시: page["generated"] = True, plan 저장
+    - 실패 시: failed 리스트에 추가, plan 저장, mid_eval 임계값 도달 여부 반환
+
+    Returns:
+        True면 mid_eval이 발동해야 하므로 현재 배치를 중단할 것.
+    """
+    if result.get("failed"):
+        page["failed_reason"] = result.get("reason", "unknown")
+        failed.append(result)
+        _save_plan(plan, plan_path)
+        if mid_eval_fn and len(failed) >= FAILURE_THRESHOLD:
+            return True  # 호출부에서 mid_eval_fn 호출 책임
+    else:
+        page["generated"] = True
+        page.pop("failed_reason", None)
+        if result.get("llm_check_failed"):
+            needs_eval.append({"path": page["path"], "reason": "llm_check_failed"})
+        _save_plan(plan, plan_path)
+    return False

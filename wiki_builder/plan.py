@@ -39,8 +39,6 @@ def run_plan(
     Returns:
         plan dict {"planned_sources": [...], "pages": [...]}
     """
-    from wiki_builder.prompt_loader import load_prompt
-    PLANNER_SYSTEM, PLANNER_USER = load_prompt("planner")
 
     # 소스 파일 수집 (.docx, .txt)
     source_files = _collect_sources(sources_dir)
@@ -64,9 +62,7 @@ def run_plan(
         new_sources = source_files
         all_pages = []
 
-    existing_paths: set[str] = {p["path"] for p in all_pages}
-    existing_descriptions: dict[str, str] = {p["path"]: p["description"] for p in all_pages}
-    page_index: dict[str, int] = {p["path"]: i for i, p in enumerate(all_pages)}
+    existing_paths, existing_descriptions, page_index = _build_page_index(all_pages)
 
     for src_path in new_sources:
         logger.info(f"소스 파일 처리: {src_path}")
@@ -84,15 +80,25 @@ def run_plan(
             continue
 
         logger.info(f"  → {len(chunks)}개 청크")
+        for i, c in enumerate(chunks):
+            logger.info(f"    청크 {i}: {len(c['text'])}자")
 
         for chunk in chunks:
-            pages = _plan_chunk(
-                chunk=chunk,
-                source_file=os.path.relpath(src_path, os.path.dirname(sources_dir)),
-                existing_pages_info=existing_descriptions,
-                call_llm=call_llm,
-                backend=backend,
-            )
+            # 503 등 서버 오류 시 성공할 때까지 무한 재시도
+            while True:
+                logger.info(f"  청크 {chunk['index']} 처리 중...")
+                pages = _plan_chunk(
+                    chunk=chunk,
+                    source_file=os.path.relpath(src_path, os.path.dirname(sources_dir)),
+                    existing_pages_info=existing_descriptions,
+                    call_llm=call_llm,
+                    backend=backend,
+                )
+                if pages is not None:
+                    break
+                logger.warning(f"  청크 {chunk['index']} 재시도 대기 30초...")
+                time.sleep(30)
+
             for p in pages:
                 if p["path"] not in existing_paths:
                     all_pages.append(p)
@@ -132,18 +138,20 @@ def _plan_chunk(
     existing_pages_info: dict[str, str],  # path → description
     call_llm,
     backend: str,
-) -> list[dict]:
-    """청크 하나에서 LLM으로 페이지 목록 추출."""
+) -> list[dict] | None:
+    """
+    청크 하나에서 LLM으로 페이지 목록 추출.
+    LLM 호출 실패(503 등) 시 None 반환 → 호출부에서 재시도.
+    파싱 실패 3회 시 None 반환.
+    정상 처리(페이지 없음 포함) 시 list 반환.
+    """
     from wiki_builder.prompt_loader import load_prompt
-    PLANNER_SYSTEM, PLANNER_USER = load_prompt("planner")
+    PLANNER_SYSTEM, PLANNER_USER = load_prompt("planner")  # noqa: N806 — 프롬프트 상수 관례
 
-    if existing_pages_info:
-        existing_list = "\n".join(
-            f"{path}: {desc}"
-            for path, desc in sorted(existing_pages_info.items())
-        )
-    else:
-        existing_list = "(없음)"
+    existing_list = "\n".join(
+        f"{path}: {desc}"
+        for path, desc in sorted(existing_pages_info.items())
+    ) if existing_pages_info else "(없음)"
 
     from wiki_builder.api import MAX_CHUNK_CHARS, truncate_content
     chunk_text = truncate_content(chunk["text"], MAX_CHUNK_CHARS, label=f"chunk_{chunk['index']}")
@@ -154,40 +162,34 @@ def _plan_chunk(
         chunk_text=chunk_text,
     )
 
-    parse_failures = 0
-    llm_wait = 30  # LLM 호출 실패 시 초기 대기 시간
-    while True:
+    for attempt in range(3):
+        logger.info(f"  청크 {chunk['index']} LLM 입력 — system: {len(PLANNER_SYSTEM)}자, user: {len(user_msg)}자")
         raw = call_llm(
             PLANNER_SYSTEM,
             user_msg,
             temperature=0.1,
             backend=backend,
             json_format=True,
-            max_tokens=4096,
+            max_tokens=16384,
         )
 
         if raw.startswith("[LLM 호출 실패]"):
-            logger.warning(f"Planner LLM 실패 (청크 {chunk['index']}) — {llm_wait}초 후 재시도: {raw}")
-            time.sleep(llm_wait)
-            llm_wait = min(llm_wait * 2, 300)  # 최대 5분
-            continue
-
-        llm_wait = 30  # LLM 성공 시 대기 시간 초기화
+            logger.error(f"Planner LLM 실패 (청크 {chunk['index']}): {raw}")
+            return None  # 서버 오류 → 호출부에서 재시도
 
         pages = _parse_planner_response(raw, source_file)
         if pages is not None:
             return pages
 
-        parse_failures += 1
-        logger.warning(f"Planner 파싱 실패 ({parse_failures}회) (청크 {chunk['index']}) — raw 응답 (첫 500자): {raw[:500]!r}")
-        if parse_failures >= 3:
-            logger.error(f"Planner 파싱 3회 모두 실패 (청크 {chunk['index']}) — 스킵")
-            return []
+        logger.warning(f"Planner 파싱 실패 (시도 {attempt + 1}/3) — raw 응답 (첫 500자): {raw[:500]!r}")
+        logger.warning("재시도")
+
+    logger.error(f"Planner 파싱 3회 모두 실패 (청크 {chunk['index']})")
+    return None  # 파싱 실패도 재시도 대상
 
 
 def _parse_planner_response(raw: str, source_file: str) -> list[dict] | None:
-    """LLM 응답에서 JSON 배열 파싱."""
-    # 코드블록 제거
+    """LLM 응답에서 JSON 배열 파싱. 파싱 불가 시 None 반환."""
     text = re.sub(r'```json\s*', '', raw)
     text = re.sub(r'```\s*', '', text)
     text = text.strip()
@@ -209,15 +211,27 @@ def _parse_planner_response(raw: str, source_file: str) -> list[dict] | None:
     except json.JSONDecodeError:
         pass
 
-    # 2) 전체 파싱 실패 시 텍스트 내 JSON 배열 추출
+    # 2) 완전한 배열 추출 시도
     if data is None:
         m = re.search(r'\[.*\]', text, re.DOTALL)
-        if not m:
-            return None
-        try:
-            data = json.loads(m.group())
-        except json.JSONDecodeError:
-            return None
+        if m:
+            try:
+                data = json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+
+    # 3) 불완전한 JSON 복구 (max_tokens로 잘린 경우)
+    if data is None:
+        m = re.search(r'\[.*', text, re.DOTALL)
+        if m:
+            partial = m.group()
+            last_complete = partial.rfind('},')
+            if last_complete != -1:
+                try:
+                    data = json.loads(partial[:last_complete + 1] + ']')
+                    logger.warning(f"불완전한 JSON 복구 성공 (잘린 응답)")
+                except json.JSONDecodeError:
+                    pass
 
     if not isinstance(data, list):
         return None
@@ -260,6 +274,27 @@ def _parse_planner_response(raw: str, source_file: str) -> list[dict] | None:
         })
 
     return pages
+
+
+def _build_page_index(pages: list) -> tuple[set, dict, dict]:
+    """
+    pages 리스트에서 빠른 조회를 위한 인덱스 구조 3개를 한 번에 생성.
+
+    Returns:
+        (existing_paths, existing_descriptions, page_index)
+        - existing_paths: path 집합 (중복 체크용)
+        - existing_descriptions: path → description (LLM 컨텍스트 전달용)
+        - page_index: path → pages 리스트 내 정수 인덱스 (멀티소스 머지용)
+    """
+    existing_paths: set[str] = set()
+    existing_descriptions: dict[str, str] = {}
+    page_index: dict[str, int] = {}
+    for i, page in enumerate(pages):
+        path = page["path"]
+        existing_paths.add(path)
+        existing_descriptions[path] = page["description"]
+        page_index[path] = i
+    return existing_paths, existing_descriptions, page_index
 
 
 def _save_plan_incremental(plan_path: str, planned_sources: set, pages: list) -> dict:

@@ -130,6 +130,37 @@ def configure_ollama(base_url: str = "", model: str = "", context_window: int = 
 # 공개 인터페이스
 # ──────────────────────────────────────────────
 
+def _validate_backend(backend: str) -> bool:
+    return backend in ("claude", "gemini", "gptoss", "ollama")
+
+
+def _dispatch_simple(backend: str, system: str, user: str, temperature: float, **kwargs) -> str:
+    """백엔드별 단순 호출 분기."""
+    if backend == "claude":
+        return _call_claude(system, user, temperature, **kwargs)
+    elif backend == "gemini":
+        return _call_gemini(system, user, temperature, **kwargs)
+    elif backend == "ollama":
+        return _call_ollama(system, user, temperature, **kwargs)
+    else:
+        return _call_gptoss(system, user, temperature, **kwargs)
+
+
+def _dispatch_tools(backend: str, system: str, messages: list, tools: list, temperature: float) -> dict:
+    """백엔드별 tool use 호출 분기."""
+    if backend == "claude":
+        return _call_claude_tools(system, messages, tools, temperature)
+    elif backend == "gemini":
+        return _call_gemini_tools(system, messages, tools, temperature)
+    elif backend == "ollama":
+        return _call_ollama_tools(system, messages, tools, temperature)
+    else:
+        return _call_gptoss_tools(system, messages, tools, temperature)
+
+
+_TOOLS_FAILURE = {"tool_calls": [], "stop_reason": "error", "raw": None}
+
+
 def call_with_tools(
     system: str,
     messages: list,
@@ -151,21 +182,13 @@ def call_with_tools(
     실패 시: {"text": "[LLM 호출 실패] ...", "tool_calls": [], "stop_reason": "error", "raw": None}
     """
     _backend = backend or BACKEND
-    if _backend not in ("claude", "gemini", "gptoss", "ollama"):
-        return {"text": f"[LLM 호출 실패] 알 수 없는 백엔드: {_backend}", "tool_calls": [],
-                "stop_reason": "error", "raw": None}
+    if not _validate_backend(_backend):
+        return {"text": f"[LLM 호출 실패] 알 수 없는 백엔드: {_backend}", **_TOOLS_FAILURE}
 
     attempt = 0
     while attempt < MAX_RETRIES:
         try:
-            if _backend == "claude":
-                return _call_claude_tools(system, messages, tools, temperature)
-            elif _backend == "gemini":
-                return _call_gemini_tools(system, messages, tools, temperature)
-            elif _backend == "ollama":
-                return _call_ollama_tools(system, messages, tools, temperature)
-            else:
-                return _call_gptoss_tools(system, messages, tools, temperature)
+            return _dispatch_tools(_backend, system, messages, tools, temperature)
         except _RateLimitError:
             logger.warning(f"Rate limit — {RATE_LIMIT_WAIT}초 대기")
             time.sleep(RATE_LIMIT_WAIT)
@@ -175,14 +198,11 @@ def call_with_tools(
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAYS[attempt - 1])
             else:
-                return {"text": f"[LLM 호출 실패] {e}", "tool_calls": [],
-                        "stop_reason": "error", "raw": None}
+                return {"text": f"[LLM 호출 실패] {e}", **_TOOLS_FAILURE}
         except Exception as e:
             logger.error(f"call_with_tools 오류: {e}")
-            return {"text": f"[LLM 호출 실패] {e}", "tool_calls": [],
-                    "stop_reason": "error", "raw": None}
-    return {"text": "[LLM 호출 실패] 최대 재시도 초과", "tool_calls": [],
-            "stop_reason": "error", "raw": None}
+            return {"text": f"[LLM 호출 실패] {e}", **_TOOLS_FAILURE}
+    return {"text": "[LLM 호출 실패] 최대 재시도 초과", **_TOOLS_FAILURE}
 
 
 def call_simple(system: str, user: str, temperature: float = 0.3, **kwargs) -> str:
@@ -204,20 +224,13 @@ def call_simple(system: str, user: str, temperature: float = 0.3, **kwargs) -> s
         user = user[:max(0, allowed_user_chars)]
         logger.warning(f"입력 총량 초과 — user 메시지 {trimmed}자 truncate (backend={backend})")
 
-    if backend not in ("claude", "gemini", "gptoss", "ollama"):
+    if not _validate_backend(backend):
         return f"[LLM 호출 실패] 알 수 없는 백엔드: {backend}"
 
     attempt = 0
     while attempt < MAX_RETRIES:
         try:
-            if backend == "claude":
-                return _call_claude(system, user, temperature, **kwargs)
-            elif backend == "gemini":
-                return _call_gemini(system, user, temperature, **kwargs)
-            elif backend == "ollama":
-                return _call_ollama(system, user, temperature, **kwargs)
-            else:
-                return _call_gptoss(system, user, temperature, **kwargs)
+            return _dispatch_simple(backend, system, user, temperature, **kwargs)
         except _RateLimitError:
             logger.warning(f"Rate limit — {RATE_LIMIT_WAIT}초 대기")
             time.sleep(RATE_LIMIT_WAIT)
@@ -251,6 +264,58 @@ class _RetryableError(Exception):
 # ──────────────────────────────────────────────
 # Tool use 내부 구현
 # ──────────────────────────────────────────────
+
+def _parse_openai_tool_calls(raw_tool_calls: list) -> list[dict]:
+    """
+    OpenAI 호환 tool_calls 배열을 내부 형식으로 변환.
+    gpt-oss와 ollama 양쪽이 동일 포맷을 사용하므로 공통 처리.
+    """
+    import json as _json
+    tool_calls = []
+    for tc in raw_tool_calls:
+        fn = tc.get("function", {})
+        args = fn.get("arguments", "{}")
+        try:
+            input_dict = _json.loads(args) if isinstance(args, str) else (args or {})
+        except Exception:
+            input_dict = {}
+        tool_calls.append({
+            "id": tc.get("id", f"tool_{fn.get('name', '')}"),
+            "name": fn.get("name", ""),
+            "input": input_dict,
+        })
+    return tool_calls
+
+
+def _build_openai_tool_response(msg: dict, raw_tool_calls: list) -> dict:
+    """OpenAI 호환 응답 메시지에서 내부 tool response dict 구성."""
+    tool_calls = _parse_openai_tool_calls(raw_tool_calls)
+    return {
+        "text": msg.get("content") or "",
+        "tool_calls": tool_calls,
+        "stop_reason": "tool_use" if tool_calls else "end_turn",
+        "raw": {
+            "role": "assistant",
+            "content": msg.get("content"),
+            "tool_calls": raw_tool_calls if raw_tool_calls else None,
+        },
+    }
+
+
+def _to_openai_tools(tools: list) -> list:
+    """내부 tool 정의를 OpenAI function calling 형식으로 변환."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in tools
+    ]
+
 
 def _schema_to_gemini(schema: dict) -> dict:
     """JSON Schema 타입명을 Gemini REST API 형식(대문자)으로 변환."""
@@ -294,7 +359,7 @@ def _call_claude_tools(system: str, messages: list, tools: list, temperature: fl
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
-            max_tokens=4096,
+            max_tokens=16384,
             temperature=temperature,
             system=system,
             messages=messages,
@@ -414,7 +479,6 @@ def _call_gemini_tools(system: str, messages: list, tools: list, temperature: fl
 
 def _call_gptoss_tools(system: str, messages: list, tools: list, temperature: float) -> dict:
     import requests
-    import json as _json
 
     cfg = _gptoss_config
     if not cfg["api_key"]:
@@ -422,34 +486,21 @@ def _call_gptoss_tools(system: str, messages: list, tools: list, temperature: fl
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg['api_key']}",
+        "x-dep-ticket": cfg["api_key"],
+        "Send-System-Name": "Tracer",
+        "User-Id": cfg["knox_id"],
+        "User-Type": cfg["ad_id"],
     }
-    if cfg["knox_id"]:
-        headers["X-Knox-ID"] = cfg["knox_id"]
-    if cfg["ad_id"]:
-        headers["X-AD-ID"] = cfg["ad_id"]
-
-    openai_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "parameters": t["input_schema"],
-            },
-        }
-        for t in tools
-    ]
 
     # gpt-oss: system을 messages 앞에 prepend
     full_messages = [{"role": "system", "content": system}] + messages
 
     payload = {
-        "model": "gpt-oss-120b",
+        "model": "openai/gpt-oss-120b",
         "messages": full_messages,
-        "tools": openai_tools,
+        "tools": _to_openai_tools(tools),
         "temperature": temperature,
-        "max_tokens": 4096,
+        "max_tokens": 16384,
     }
 
     try:
@@ -470,36 +521,8 @@ def _call_gptoss_tools(system: str, messages: list, tools: list, temperature: fl
     except Exception as e:
         raise _RetryableError(str(e))
 
-    data = resp.json()
-    choice = data["choices"][0]
-    msg = choice["message"]
-
-    text = msg.get("content") or ""
-    raw_tool_calls = msg.get("tool_calls") or []
-
-    tool_calls = []
-    for tc in raw_tool_calls:
-        fn = tc.get("function", {})
-        try:
-            input_dict = _json.loads(fn.get("arguments", "{}"))
-        except Exception:
-            input_dict = {}
-        tool_calls.append({"id": tc["id"], "name": fn["name"], "input": input_dict})
-
-    stop_reason = "tool_use" if tool_calls else "end_turn"
-
-    raw = {
-        "role": "assistant",
-        "content": msg.get("content"),
-        "tool_calls": raw_tool_calls if raw_tool_calls else None,
-    }
-
-    return {
-        "text": text,
-        "tool_calls": tool_calls,
-        "stop_reason": stop_reason,
-        "raw": raw,
-    }
+    msg = resp.json()["choices"][0]["message"]
+    return _build_openai_tool_response(msg, msg.get("tool_calls") or [])
 
 
 # ──────────────────────────────────────────────
@@ -517,7 +540,7 @@ def _call_claude(system: str, user: str, temperature: float, **kwargs) -> str:
         return "[LLM 호출 실패] ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다"
 
     model = kwargs.get("model", "claude-sonnet-4-5")
-    max_tokens = kwargs.get("max_tokens", 4096)
+    max_tokens = kwargs.get("max_tokens", 16384)
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
@@ -549,7 +572,7 @@ def _call_gemini(system: str, user: str, temperature: float, **kwargs) -> str:
         return "[LLM 호출 실패] GEMINI_API_KEY 환경변수가 설정되지 않았습니다"
 
     model = kwargs.get("model", _gemini_config["model"])
-    max_tokens = kwargs.get("max_tokens", 4096)
+    max_tokens = kwargs.get("max_tokens", 16384)
     url = f"{_gemini_config['base_url']}/{model}:generateContent"
 
     payload = {
@@ -626,21 +649,20 @@ def _call_gptoss(system: str, user: str, temperature: float, **kwargs) -> str:
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg['api_key']}",
+        "x-dep-ticket": cfg["api_key"],
+        "Send-System-Name": "Tracer",
+        "User-Id": cfg["knox_id"],
+        "User-Type": cfg["ad_id"],
     }
-    if cfg["knox_id"]:
-        headers["X-Knox-ID"] = cfg["knox_id"]
-    if cfg["ad_id"]:
-        headers["X-AD-ID"] = cfg["ad_id"]
 
     payload = {
-        "model": "gpt-oss-120b",
+        "model": "openai/gpt-oss-120b",
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         "temperature": temperature,
-        "max_tokens": kwargs.get("max_tokens", 4096),
+        "max_tokens": kwargs.get("max_tokens", 16384),
     }
 
     try:
@@ -720,29 +742,16 @@ def _call_ollama(system: str, user: str, temperature: float, **kwargs) -> str:
 
 def _call_ollama_tools(system: str, messages: list, tools: list, temperature: float) -> dict:
     import requests
-    import json as _json
 
     cfg = _ollama_config
     url = f"{cfg['base_url']}/v1/chat/completions"
-
-    openai_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "parameters": t["input_schema"],
-            },
-        }
-        for t in tools
-    ]
 
     full_messages = [{"role": "system", "content": system}] + messages
 
     payload = {
         "model": cfg["model"],
         "messages": full_messages,
-        "tools": openai_tools,
+        "tools": _to_openai_tools(tools),
         "temperature": temperature,
         "max_tokens": 2048,
         "stream": False,
@@ -771,36 +780,8 @@ def _call_ollama_tools(system: str, messages: list, tools: list, temperature: fl
     except Exception as e:
         raise _RetryableError(str(e))
 
-    data = resp.json()
-    choice = data["choices"][0]
-    msg = choice["message"]
-
-    text = msg.get("content") or ""
-    raw_tool_calls = msg.get("tool_calls") or []
-
-    tool_calls = []
-    for tc in raw_tool_calls:
-        fn = tc.get("function", {})
-        try:
-            input_dict = _json.loads(fn.get("arguments", "{}")) if isinstance(fn.get("arguments"), str) else fn.get("arguments", {})
-        except Exception:
-            input_dict = {}
-        tool_calls.append({"id": tc.get("id", f"ollama_{fn.get('name','')}"), "name": fn.get("name", ""), "input": input_dict})
-
-    stop_reason = "tool_use" if tool_calls else "end_turn"
-
-    raw = {
-        "role": "assistant",
-        "content": msg.get("content"),
-        "tool_calls": raw_tool_calls if raw_tool_calls else None,
-    }
-
-    return {
-        "text": text,
-        "tool_calls": tool_calls,
-        "stop_reason": stop_reason,
-        "raw": raw,
-    }
+    msg = resp.json()["choices"][0]["message"]
+    return _build_openai_tool_response(msg, msg.get("tool_calls") or [])
 
 
 # ──────────────────────────────────────────────

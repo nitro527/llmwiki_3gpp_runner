@@ -33,7 +33,8 @@ def check_quality(
     spec_content: str,
     call_llm,
     *,
-    backend: str = "claude",
+    backend: str = "gptoss",
+    feature_hint: str = "",
 ) -> dict:
     """
     wiki 페이지 품질 평가.
@@ -47,8 +48,9 @@ def check_quality(
     quick = _quick_check(content)
 
     user_msg = CHECKER_USER.format(
-        page_content=content[:4000],
-        spec_content=spec_content[:2000],
+        page_content=content,
+        spec_content=spec_content,
+        feature_hint=feature_hint,
     )
 
     for attempt in range(3):
@@ -119,20 +121,23 @@ def _quick_check(content: str) -> dict:
     }
 
 
-def _parse_checker_response(raw: str) -> dict | None:
+def _extract_json_object(raw: str) -> dict | None:
+    """LLM 응답에서 첫 번째 JSON 객체를 추출. 파싱 불가 시 None."""
     text = re.sub(r'```json\s*', '', raw)
-    text = re.sub(r'```\s*', '', text)
-    text = text.strip()
-
+    text = re.sub(r'```\s*', '', text).strip()
     m = re.search(r'\{.*\}', text, re.DOTALL)
     if not m:
         return None
-
     try:
-        data = json.loads(m.group())
+        return json.loads(m.group())
     except json.JSONDecodeError:
         return None
 
+
+def _parse_checker_response(raw: str) -> dict | None:
+    data = _extract_json_object(raw)
+    if data is None:
+        return None
     score = data.get("score", 0)
     return {
         "score": score,
@@ -673,15 +678,7 @@ def _format_failed_summary(failed_pages: list[dict]) -> str:
 
 
 def _parse_evaluator_response(raw: str) -> dict | None:
-    text = re.sub(r'```json\s*', '', raw)
-    text = re.sub(r'```\s*', '', text)
-    m = re.search(r'\{.*\}', text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group())
-    except json.JSONDecodeError:
-        return None
+    return _extract_json_object(raw)
 
 
 def _hash_text(text: str) -> str:
