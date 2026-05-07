@@ -47,4 +47,12 @@ def load_prompt(agent_name: str) -> tuple[str, str]:
         )
 
     system_part, user_part = text.split(_SEPARATOR, maxsplit=1)
+
+    # patches 자동 합산 (해당 에이전트의 _patches.md 존재 시)
+    patches_path = _SUB_AGENTS_DIR / f"{agent_name}_patches.md"
+    if patches_path.exists():
+        patches = patches_path.read_text(encoding="utf-8").strip()
+        if patches:
+            system_part = system_part.strip() + "\n\n## 추가 지시사항\n" + patches
+
     return system_part.strip(), user_part.strip()

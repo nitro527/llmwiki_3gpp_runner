@@ -9,6 +9,7 @@ run_plan(sources_dir, wiki_dir, plan_path, call_llm, chunk_fn) -> dict
 import os
 import json
 import re
+import time
 import logging
 from pathlib import Path
 
@@ -153,7 +154,9 @@ def _plan_chunk(
         chunk_text=chunk_text,
     )
 
-    for attempt in range(3):
+    parse_failures = 0
+    llm_wait = 30  # LLM 호출 실패 시 초기 대기 시간
+    while True:
         raw = call_llm(
             PLANNER_SYSTEM,
             user_msg,
@@ -164,18 +167,22 @@ def _plan_chunk(
         )
 
         if raw.startswith("[LLM 호출 실패]"):
-            logger.error(f"Planner LLM 실패 (청크 {chunk['index']}): {raw}")
-            return []
+            logger.warning(f"Planner LLM 실패 (청크 {chunk['index']}) — {llm_wait}초 후 재시도: {raw}")
+            time.sleep(llm_wait)
+            llm_wait = min(llm_wait * 2, 300)  # 최대 5분
+            continue
+
+        llm_wait = 30  # LLM 성공 시 대기 시간 초기화
 
         pages = _parse_planner_response(raw, source_file)
         if pages is not None:
             return pages
 
-        logger.warning(f"Planner 파싱 실패 (시도 {attempt + 1}/3) — raw 응답 (첫 500자): {raw[:500]!r}")
-        logger.warning("재시도")
-
-    logger.error(f"Planner 파싱 3회 모두 실패 (청크 {chunk['index']})")
-    return []
+        parse_failures += 1
+        logger.warning(f"Planner 파싱 실패 ({parse_failures}회) (청크 {chunk['index']}) — raw 응답 (첫 500자): {raw[:500]!r}")
+        if parse_failures >= 3:
+            logger.error(f"Planner 파싱 3회 모두 실패 (청크 {chunk['index']}) — 스킵")
+            return []
 
 
 def _parse_planner_response(raw: str, source_file: str) -> list[dict] | None:

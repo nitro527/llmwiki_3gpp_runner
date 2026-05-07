@@ -43,6 +43,10 @@ def _read_docx(path: str) -> str:
     lines = []
 
     for para in doc.paragraphs:
+        # TOC 단락 제외 (스타일명 "TOC 1", "TOC 2" 등)
+        if para.style and para.style.name.lower().startswith("toc"):
+            continue
+
         text = para.text.strip()
         if not text:
             continue
