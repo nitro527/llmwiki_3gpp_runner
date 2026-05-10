@@ -33,6 +33,8 @@
 
 ## 관계 타입 (관련 개념 섹션에서만 사용)
 affects / depends_on / triggers / part_of / similar_to / implements
+이 6개만 유효. 반드시 괄호 형식: `- [[Slot]] (part_of)`
+모든 항목에 관계 타입 필수 — 하나라도 누락 시 감점.
 
 ## wikilink 규칙
 - 기술 개체 최초 언급 시 [[PUSCH]], [[HARQ]] 형태로 링크
