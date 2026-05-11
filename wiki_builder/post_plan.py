@@ -13,6 +13,10 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import wiki_builder.api
+from wiki_builder.prompt_loader import load_prompt
+from wiki_builder.utils import save_plan
+
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 8  # LLM 호출당 검증 페이지 수
@@ -22,7 +26,7 @@ def run_post_plan(
     plan: dict,
     plan_path: str,
     call_llm,
-    backend: str = "gemini",
+    backend: str | None = None,
 ) -> dict:
     """
     Phase 1.5 실행.
@@ -31,11 +35,13 @@ def run_post_plan(
         plan: plan.json dict
         plan_path: plan.json 저장 경로
         call_llm: call_simple 함수 참조
-        backend: LLM 백엔드
+        backend: LLM 백엔드. None이면 WIKI_BACKEND 환경변수 사용.
 
     Returns:
         업데이트된 plan dict
     """
+    backend = backend or wiki_builder.api.BACKEND
+
     if plan.get("post_plan_done"):
         logger.info("Post-Plan 이미 완료 — 스킵")
         return plan
@@ -65,8 +71,7 @@ def run_post_plan(
 
     # Step 5: plan.json 저장
     plan["post_plan_done"] = True
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
+    save_plan(plan, plan_path)
 
     logger.info(
         f"Post-Plan 완료 — "
@@ -108,7 +113,6 @@ def _check_duplicate_sections(pages: list) -> list:
 
 def _check_semantic_mismatch(pages: list, call_llm, backend: str) -> list:
     """LLM으로 페이지별 의미적 불일치 감지."""
-    from wiki_builder.prompt_loader import load_prompt
     POST_PLAN_SYSTEM, POST_PLAN_USER = load_prompt("post_plan")
 
     all_fixes = []

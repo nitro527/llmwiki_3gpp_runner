@@ -16,136 +16,16 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from wiki_builder.utils import save_plan, extract_json_from_llm
+from wiki_builder.quality import check_quality, _quick_check, PASS_SCORE
+
+import wiki_builder.api
+from wiki_builder.prompt_loader import load_prompt
 
 logger = logging.getLogger(__name__)
 
-PASS_SCORE = 8
 MAX_EVAL_ROUNDS = 5
 PATCH_CLEANUP_INTERVAL = 5
-
-
-# ──────────────────────────────────────────────
-# Quality Checker
-# ──────────────────────────────────────────────
-
-def check_quality(
-    content: str,
-    spec_content: str,
-    call_llm,
-    *,
-    backend: str = "gptoss",
-    feature_hint: str = "",
-) -> dict:
-    """
-    wiki 페이지 품질 평가.
-
-    Returns:
-        {"score": int, "pass": bool, "issues": list, "details": dict}
-    """
-    from wiki_builder.prompt_loader import load_prompt
-    CHECKER_SYSTEM, CHECKER_USER = load_prompt("checker")
-
-    quick = _quick_check(content)
-
-    user_msg = CHECKER_USER.format(
-        page_content=content,
-        spec_content=spec_content,
-        feature_hint=feature_hint,
-    )
-
-    for attempt in range(3):
-        raw = call_llm(CHECKER_SYSTEM, user_msg, temperature=0.1, backend=backend, json_format=True)
-
-        if raw.startswith("[LLM 호출 실패]"):
-            logger.error(f"Checker LLM 실패: {raw}")
-            return quick
-
-        result = _parse_checker_response(raw)
-        if result is not None:
-            return result
-
-        logger.warning(f"Checker 파싱 실패 (시도 {attempt + 1}/3)")
-
-    logger.error("Checker LLM 파싱 3회 실패 — 구조 검사 결과 사용")
-    return {**quick, "llm_check_failed": True}
-
-
-def _quick_check(content: str) -> dict:
-    """구조 기반 빠른 품질 검사 (LLM 없이)."""
-    required_sections = [
-        "## 정의", "## 요약", "## 상세 설명",
-        "## 인과 관계", "## 관련 개념", "## 스펙 근거", "## 소스",
-    ]
-    missing = [s for s in required_sections if s not in content]
-    structure_score = 2 if not missing else (1 if len(missing) <= 2 else 0)
-
-    related_section = re.search(r'## 관련 개념\n(.*?)(?=\n##|\Z)', content, re.DOTALL)
-    has_relation_types = False
-    if related_section:
-        links = re.findall(r'\[\[([^\]]+)\]\]', related_section.group(1))
-        has_relation_types = all(
-            re.search(r'\([^)]+\)', link) or '(' in related_section.group(1)
-            for link in links
-        ) if links else True
-
-    has_bold = bool(re.search(r'\*\*[^*]+\*\*', content))
-
-    score = structure_score
-    score += 1 if not has_bold else 0
-    score += 1 if has_relation_types else 0
-    score += 1 if "## 스펙 근거" in content else 0
-    score += 2  # hallucination: 구조로 판단 불가, 기본 2점
-    score += 1 if "## 상세 설명" in content else 0
-
-    issues = []
-    if missing:
-        issues.append(f"누락 섹션: {', '.join(missing)}")
-    if has_bold:
-        issues.append("**bold** 사용 감지 — [[wikilink]] 로 변경 필요")
-    if not has_relation_types:
-        issues.append("관련 개념에 관계 타입 누락")
-
-    return {
-        "score": score,
-        "pass": score >= PASS_SCORE,
-        "issues": issues,
-        "details": {
-            "structure": structure_score,
-            "no_translation": 1 if not has_bold else 0,
-            "relation_types": 1 if has_relation_types else 0,
-            "source_reference": 1 if "## 스펙 근거" in content else 0,
-            "no_hallucination": 2,
-            "spec_based": 1 if "## 상세 설명" in content else 0,
-        },
-        "method": "quick_check",
-    }
-
-
-def _extract_json_object(raw: str) -> dict | None:
-    """LLM 응답에서 첫 번째 JSON 객체를 추출. 파싱 불가 시 None."""
-    text = re.sub(r'```json\s*', '', raw)
-    text = re.sub(r'```\s*', '', text).strip()
-    m = re.search(r'\{.*\}', text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group())
-    except json.JSONDecodeError:
-        return None
-
-
-def _parse_checker_response(raw: str) -> dict | None:
-    data = _extract_json_object(raw)
-    if data is None:
-        return None
-    score = data.get("score", 0)
-    return {
-        "score": score,
-        "pass": score >= PASS_SCORE,
-        "issues": data.get("issues", []),
-        "details": data.get("details", {}),
-        "method": "llm_check",
-    }
 
 
 # ──────────────────────────────────────────────
@@ -160,7 +40,7 @@ def run_evaluate(
     call_llm,
     extract_spec_fn,
     *,
-    backend: str = "claude",
+    backend: str | None = None,
     initial_failed: list[dict] | None = None,
 ) -> None:
     """
@@ -169,7 +49,8 @@ def run_evaluate(
     initial_failed: generate phase에서 직접 넘어온 불합격 목록.
                     None이면 generated=True 페이지를 재평가하여 수집.
     """
-    from wiki_builder.prompt_loader import load_prompt
+    backend = backend or wiki_builder.api.BACKEND
+
     EVALUATOR_SYSTEM, EVALUATOR_USER = load_prompt("evaluator")
     generator_system, generator_user = load_prompt("generator")
 
@@ -269,8 +150,7 @@ def run_evaluate(
             if page["path"] in failed_paths:
                 page["generated"] = False
 
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan, f, ensure_ascii=False, indent=2)
+        save_plan(plan, plan_path)
 
         from wiki_builder.generate import run_generate
         newly_failed = run_generate(
@@ -576,7 +456,6 @@ def analyze_and_patch(failed_pages: list[dict], call_llm, backend: str) -> bool:
     mid_eval 전용: 실패 패턴 분석 + 프롬프트 패치만 수행. 재생성 없음.
     Returns True if patch was applied.
     """
-    from wiki_builder.prompt_loader import load_prompt
     EVALUATOR_SYSTEM, EVALUATOR_USER = load_prompt("evaluator")
     generator_system, generator_user = load_prompt("generator")
 
@@ -617,7 +496,6 @@ def analyze_and_patch(failed_pages: list[dict], call_llm, backend: str) -> bool:
 
 def _call_patcher(failure_pattern: str, call_llm, backend: str) -> str:
     """failure_pattern을 받아 추가할 규칙 1-2문장을 반환."""
-    from wiki_builder.prompt_loader import load_prompt
     PATCHER_SYSTEM, PATCHER_USER = load_prompt("patcher")
     user_msg = PATCHER_USER.format(failure_pattern=failure_pattern)
     raw = call_llm(PATCHER_SYSTEM, user_msg, temperature=0.1, backend=backend)
@@ -628,8 +506,9 @@ def _call_patcher(failure_pattern: str, call_llm, backend: str) -> str:
 
 
 def _apply_prompt_fix(target: str, new_content: str,
-                      call_llm=None, backend: str = "gptoss") -> None:
+                      call_llm=None, backend: str = "") -> None:
     """수정 내용을 generator_patches.md에 누적 (generator.md 원본 불변)."""
+    backend = backend or wiki_builder.api.BACKEND
     from wiki_builder.prompt_loader import _SUB_AGENTS_DIR
     patches_path = _SUB_AGENTS_DIR / "generator_patches.md"
     existing = patches_path.read_text(encoding="utf-8").strip() if patches_path.exists() else ""
@@ -678,7 +557,7 @@ def _format_failed_summary(failed_pages: list[dict]) -> str:
 
 
 def _parse_evaluator_response(raw: str) -> dict | None:
-    return _extract_json_object(raw)
+    return extract_json_from_llm(raw)
 
 
 def _hash_text(text: str) -> str:

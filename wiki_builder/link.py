@@ -10,6 +10,10 @@ import logging
 import re
 from pathlib import Path
 
+import wiki_builder.api
+from wiki_builder.prompt_loader import load_prompt
+from wiki_builder.utils import save_plan
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,10 +23,11 @@ def run_link(
     plan_path: str,
     call_llm,
     *,
-    backend: str = "claude",
+    backend: str | None = None,
 ) -> None:
     """Phase 3 실행."""
-    from wiki_builder.prompt_loader import load_prompt
+    backend = backend or wiki_builder.api.BACKEND
+
     LINKER_SYSTEM, LINKER_USER = load_prompt("linker")
 
     pages = plan.get("pages", [])
@@ -70,9 +75,7 @@ def run_link(
 
         page["linked"] = True
 
-    # plan.json 업데이트
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
+    save_plan(plan, plan_path)
 
 
 def _build_link_map(wiki_dir: str, pages: list[dict]) -> dict[str, set]:

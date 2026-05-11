@@ -14,6 +14,7 @@ from datetime import date
 from pathlib import Path
 
 from wiki_builder.prompt_loader import load_prompt
+from wiki_builder.utils import extract_json_from_llm
 
 QUERY_SELECTOR_SYSTEM, QUERY_SELECTOR_USER = load_prompt("query_selector")
 QUERY_SYNTHESIZER_SYSTEM, QUERY_SYNTHESIZER_USER = load_prompt("query_synthesizer")
@@ -156,12 +157,7 @@ def _fallback_page_list(wiki_path: Path) -> list[str]:
 
 def _parse_json_field(text: str, field: str, default=None):
     """LLM 응답에서 JSON 블록 파싱 후 특정 필드 추출."""
-    # ```json ... ``` 블록 추출
-    m = re.search(r'```json\s*([\s\S]+?)\s*```', text)
-    if m:
-        text = m.group(1)
-    try:
-        data = json.loads(text.strip())
+    data = extract_json_from_llm(text)
+    if isinstance(data, dict):
         return data.get(field, default)
-    except Exception:
-        return default
+    return default

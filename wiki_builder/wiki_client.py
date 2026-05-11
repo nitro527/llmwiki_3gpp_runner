@@ -27,6 +27,7 @@ llmwiki venv의 서버 프로세스를 spawn하여 JSON stdio로 통신.
 
 import json
 import logging
+import os
 import queue
 import subprocess
 import sys
@@ -51,7 +52,7 @@ class WikiClient:
         self,
         python_exe: str,
         wiki_root: str,
-        backend: str = "gptoss",
+        backend: str | None = None,
         api_key: str = "",
         knox_id: str = "",
         ad_id: str = "",
@@ -59,7 +60,7 @@ class WikiClient:
     ):
         self._python_exe = python_exe
         self._wiki_root = Path(wiki_root)
-        self._backend = backend
+        self._backend = backend or os.getenv("WIKI_BACKEND", "gemini")
         self._api_key = api_key
         self._knox_id = knox_id
         self._ad_id = ad_id

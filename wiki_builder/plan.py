@@ -13,6 +13,11 @@ import time
 import logging
 from pathlib import Path
 
+import wiki_builder.api
+from wiki_builder.api import MAX_CHUNK_CHARS, truncate_content
+from wiki_builder.prompt_loader import load_prompt
+from wiki_builder.utils import save_plan
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,7 +28,7 @@ def run_plan(
     call_llm,
     chunk_fn,
     *,
-    backend: str = "claude",
+    backend: str | None = None,
 ) -> dict:
     """
     Phase 1 실행.
@@ -34,11 +39,12 @@ def run_plan(
         plan_path: plan.json 경로
         call_llm: call_simple 함수 참조
         chunk_fn: chunk_file 함수 참조
-        backend: "claude" or "gptoss"
+        backend: LLM 백엔드. None이면 WIKI_BACKEND 환경변수 사용.
 
     Returns:
         plan dict {"planned_sources": [...], "pages": [...]}
     """
+    backend = backend or wiki_builder.api.BACKEND
 
     # 소스 파일 수집 (.docx, .txt)
     source_files = _collect_sources(sources_dir)
@@ -67,7 +73,6 @@ def run_plan(
     for src_path in new_sources:
         logger.info(f"소스 파일 처리: {src_path}")
         try:
-            from wiki_builder.api import MAX_CHUNK_CHARS
             # MAX_CHUNK_CHARS는 백엔드 context window 기준으로 api.py가 동적 계산
             max_c = MAX_CHUNK_CHARS
             min_c = int(max_c * 0.8)
@@ -145,7 +150,6 @@ def _plan_chunk(
     파싱 실패 3회 시 None 반환.
     정상 처리(페이지 없음 포함) 시 list 반환.
     """
-    from wiki_builder.prompt_loader import load_prompt
     PLANNER_SYSTEM, PLANNER_USER = load_prompt("planner")  # noqa: N806 — 프롬프트 상수 관례
 
     existing_list = "\n".join(
@@ -153,7 +157,6 @@ def _plan_chunk(
         for path, desc in sorted(existing_pages_info.items())
     ) if existing_pages_info else "(없음)"
 
-    from wiki_builder.api import MAX_CHUNK_CHARS, truncate_content
     chunk_text = truncate_content(chunk["text"], MAX_CHUNK_CHARS, label=f"chunk_{chunk['index']}")
 
     user_msg = PLANNER_USER.format(
@@ -304,8 +307,7 @@ def _save_plan_incremental(plan_path: str, planned_sources: set, pages: list) ->
         "planned_sources": sorted(planned_sources),
         "pages": pages,
     }
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
+    save_plan(plan, plan_path)
     return plan
 
 

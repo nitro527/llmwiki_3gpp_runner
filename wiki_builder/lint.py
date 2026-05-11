@@ -13,6 +13,7 @@ from datetime import date
 from pathlib import Path
 
 from wiki_builder.prompt_loader import load_prompt
+from wiki_builder.utils import save_plan, extract_json_from_llm
 
 LINT_SYSTEM, LINT_USER = load_prompt("lint")
 
@@ -174,19 +175,11 @@ def _llm_analyze_batch(batch: list[str], wiki_path: Path, call_llm) -> dict:
         logger.warning(f"Lint LLM 호출 실패: {raw}")
         return {}
 
-    return _parse_lint_json(raw)
-
-
-def _parse_lint_json(text: str) -> dict:
-    """LLM 응답에서 JSON 파싱."""
-    m = re.search(r'```json\s*([\s\S]+?)\s*```', text)
-    if m:
-        text = m.group(1)
-    try:
-        return json.loads(text.strip())
-    except Exception:
+    result = extract_json_from_llm(raw)
+    if result is None:
         logger.warning("Lint JSON 파싱 실패")
         return {}
+    return result if isinstance(result, dict) else {}
 
 
 def _save_report(report: dict, wiki_path: Path) -> str:
@@ -479,8 +472,7 @@ def _ask_user(prompt: str) -> bool:
 
 
 def _save_plan(plan: dict, plan_path: str) -> None:
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
+    save_plan(plan, plan_path)
 
 
 def _print_report_summary(report: dict) -> None:

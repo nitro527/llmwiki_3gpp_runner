@@ -10,6 +10,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
+import wiki_builder.api
+from wiki_builder.api import MAX_CONTENT_CHARS, truncate_content
+from wiki_builder.prompt_loader import load_prompt
+from wiki_builder.utils import save_plan
+
 # 무료 티어 rate limit 대응: 요청 간 최소 간격 (초)
 # gemini-2.5-flash-lite: 10 RPM → 6초/요청이면 안전
 # workers=1 + delay=6 → 최대 10 RPM 유지
@@ -30,7 +35,7 @@ def run_generate(
     extract_spec_fn,
     check_quality_fn,
     *,
-    backend: str = "claude",
+    backend: str | None = None,
     max_workers: int = 3,
     feature_list: list | None = None,
     mid_eval_fn=None,  # (failed_pages: list) -> None, sequential 모드에서만 동작
@@ -44,6 +49,8 @@ def run_generate(
     Returns:
         failed_pages: 품질 불합격 페이지 목록
     """
+    backend = backend or wiki_builder.api.BACKEND
+
     pages = plan.get("pages", [])
     wiki_page_list = "\n".join(p["path"] for p in pages)
 
@@ -159,13 +166,11 @@ def _generate_page(
     feature_list: list | None = None,
 ) -> dict:
     """단일 페이지 생성 (LLM 독립 호출)."""
-    from wiki_builder.prompt_loader import load_prompt
     GENERATOR_SYSTEM, GENERATOR_USER = load_prompt("generator")
 
     path = page["path"]
     logger.info(f"  생성 중: {path}")
 
-    from wiki_builder.api import MAX_CONTENT_CHARS, truncate_content
     from wiki_builder.parse_38822 import (
         find_relevant_features, format_feature_hint, _keywords_from_text
     )
@@ -351,8 +356,7 @@ def log_hallucination(path: str, content: str) -> None:
 
 
 def _save_plan(plan: dict, plan_path: str) -> None:
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
+    save_plan(plan, plan_path)
 
 
 def _handle_page_result(

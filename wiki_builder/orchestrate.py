@@ -53,6 +53,12 @@ logging.basicConfig(
 
 import wiki_builder.api as _wiki_api
 from wiki_builder.api import truncate_content, call_with_tools
+from wiki_builder.utils import save_plan
+from wiki_builder.spec_reader import (
+    extract_spec_content as _extract_spec_raw,
+    _extract_section,
+    _dedup_sections,
+)
 logger = logging.getLogger("orchestrate")
 
 
@@ -289,99 +295,8 @@ def _load_feature_list() -> list | None:
 # 섹션 추출 유틸
 # ──────────────────────────────────────────────
 
-def _extract_section(text: str, section_num: str) -> str:
-    """
-    텍스트에서 섹션 번호에 해당하는 내용 추출.
-
-    패턴: \\n{섹션번호}\\t{제목} 로 시작,
-    다음 같은 레벨 이상의 헤더까지.
-
-    TOC와 실제 섹션 모두 동일 패턴이므로 모든 매치를 찾아
-    내용이 가장 긴 것(실제 섹션)을 반환한다.
-    """
-    escaped = re.escape(section_num)
-    pattern = re.compile(rf'\n{escaped}\t')
-    m = pattern.search(text)
-    if not m:
-        logger.debug(f"섹션 없음: §{section_num}")
-        return ""
-
-    start = m.start()
-
-    # 다음 섹션 헤더(레벨 무관)에서 종료 — §6 추출 시 §6.1에서 멈춤
-    next_pat = re.compile(r'\n\d+(?:\.\d+)*\t')
-
-    m2 = next_pat.search(text, start + 1)
-    end = m2.start() if m2 else len(text)
-
-    result = text[start:end].strip()
-    logger.debug(f"섹션 추출: §{section_num} ({len(result)}자)")
-    return result
-
-
-def _dedup_sections(sections: list[str]) -> list[str]:
-    """
-    parent 섹션이 있으면 child 섹션 제거.
-    예: ["6", "6.1", "6.1.1"] → ["6"]
-        ["6.1", "6.1.1", "6.2"] → ["6.1", "6.2"]
-    """
-    result = []
-    for sec in sections:
-        # 이미 result에 있는 섹션 중 현재 섹션의 prefix인 것이 있으면 skip
-        if any(sec.startswith(parent + ".") for parent in result):
-            logger.debug(f"섹션 중복 제거: §{sec} (parent 이미 포함)")
-            continue
-        result.append(sec)
-    return result
-
-
 def extract_spec_content(plan_page: dict) -> str:
-    """
-    plan 페이지의 sources 기반으로 스펙 내용 추출.
-    소스 파일을 읽고 지정된 섹션 내용만 조합.
-    """
-    from chunk_text import read_file_content
-
-    parts = []
-    for src in plan_page.get("sources", []):
-        src_file = src.get("file", "")
-        sections = src.get("sections", [])
-
-        # 절대 경로 구성
-        candidates = [
-            ROOT / src_file,
-            SOURCES_DIR / src_file,
-            SOURCES_DIR / "3gpp" / Path(src_file).name,
-        ]
-        full_path = None
-        for c in candidates:
-            if c.exists():
-                full_path = c
-                break
-
-        if full_path is None:
-            logger.warning(f"소스 파일 없음: {src_file}")
-            continue
-
-        try:
-            content = read_file_content(str(full_path))
-        except Exception as e:
-            logger.error(f"파일 읽기 실패 ({src_file}): {e}")
-            continue
-
-        if sections:
-            deduped = _dedup_sections(sections)
-            for sec in deduped:
-                extracted = _extract_section(content, sec)
-                if extracted:
-                    parts.append(f"[{src_file} §{sec}]\n{extracted}")
-        else:
-            # 섹션 미지정 시 전체 (MAX_CONTENT_CHARS 상한)
-            parts.append(f"[{src_file}]\n{content[:_wiki_api.MAX_CONTENT_CHARS]}")
-
-    combined = "\n\n".join(parts) if parts else "(스펙 내용 없음)"
-    # 전체 합산도 MAX_CONTENT_CHARS 이하로 보장
-    return truncate_content(combined, _wiki_api.MAX_CONTENT_CHARS, label="spec_content")
+    return _extract_spec_raw(plan_page, SOURCES_DIR, ROOT, _wiki_api.MAX_CONTENT_CHARS, truncate_content)
 
 
 # ──────────────────────────────────────────────
@@ -492,8 +407,8 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
     Orchestrator LLM 에이전트가 tool 호출을 통해 각 Phase를 실행.
     user_message가 주어지면 argparse phase 무시하고 해당 메시지를 직접 사용 (chat REPL용).
     """
-    from chunk_text import chunk_file
-    from wiki_builder.evaluate import check_quality
+    from wiki_builder.chunk_text import chunk_file
+    from wiki_builder.quality import check_quality
 
     # 모든 tool이 공유하는 context (Python 클로저로 전달)
     ctx: dict = {
@@ -539,7 +454,8 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
 
             elif name == "run_generate":
                 from wiki_builder.generate import run_generate
-                from wiki_builder.evaluate import run_evaluate, check_quality
+                from wiki_builder.evaluate import run_evaluate
+from wiki_builder.quality import check_quality
                 plan = _load_plan()
                 if not plan:
                     return "[오류] plan.json 없음. run_plan을 먼저 실행하세요."
@@ -647,8 +563,7 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                     existing_paths.add(path)
                     added += 1
 
-                with open(PLAN_PATH, "w", encoding="utf-8") as _f:
-                    _json.dump(plan, _f, ensure_ascii=False, indent=2)
+                save_plan(plan, PLAN_PATH)
 
                 (WIKI_DIR / "features").mkdir(exist_ok=True)
                 return f"plan_features 완료: {added}개 features/ 페이지 추가 (Rel{releases})"
@@ -684,7 +599,7 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                 failed_list = []
 
                 from wiki_builder.generate import REQUEST_INTERVAL, _detect_hallucination, log_hallucination
-                from wiki_builder.evaluate import check_quality
+                from wiki_builder.quality import check_quality
                 features_failed = []
 
                 for i, page in enumerate(todo):
@@ -776,8 +691,7 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
                     succeeded += 1
                     logger.info(f"  생성 완료: {page['path']} (score={result.get('score')})")
 
-                with open(PLAN_PATH, "w", encoding="utf-8") as _f:
-                    _json.dump(plan, _f, ensure_ascii=False, indent=2)
+                save_plan(plan, PLAN_PATH)
 
                 # evaluate 연결용으로 ctx에 저장
                 ctx["generate_features_failed"] = features_failed
