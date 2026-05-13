@@ -18,6 +18,7 @@ call_simple(system, user, **kwargs) -> str
     호출자가 이 상수를 import해서 truncate 용도로 사용.
 """
 
+import inspect
 import os
 import time
 import logging
@@ -48,7 +49,7 @@ if BACKEND == "ollama":
     MAX_CHUNK_CHARS   = int(_ollama_ctx_tokens * 2.3 * 0.21)
 else:
     MAX_CONTEXT_CHARS = 300_000
-    MAX_CONTENT_CHARS =  90_000
+    MAX_CONTENT_CHARS = 100_000
     MAX_CHUNK_CHARS   =  50_000
 
 
@@ -109,6 +110,24 @@ def configure_ollama(base_url: str = "", model: str = "", context_window: int = 
 # 공개 인터페이스
 # ──────────────────────────────────────────────
 
+def _get_caller() -> str:
+    """wiki_builder 내부에서 call_simple/call_with_tools를 호출한 함수명 반환.
+    orchestrate.call_llm 같은 wrapper는 건너뛰고 실제 호출자를 반환."""
+    frames = []
+    for frame in inspect.stack()[2:]:
+        filename = frame[1].replace("\\", "/")
+        if "wiki_builder/" in filename and "api.py" not in filename:
+            module = os.path.basename(filename).replace(".py", "")
+            frames.append(f"{module}.{frame[3]}")
+    if not frames:
+        return "unknown"
+    # wrapper(call_llm)가 있으면 건너뛰고 그 다음 호출자 반환
+    for label in frames:
+        if "call_llm" not in label:
+            return label
+    return frames[0]
+
+
 def _validate_backend(backend: str) -> bool:
     return backend in ("claude", "gemini", "gptoss", "ollama")
 
@@ -162,6 +181,9 @@ def call_with_tools(
     if not _validate_backend(_backend):
         return {"text": f"[LLM 호출 실패] 알 수 없는 백엔드: {_backend}", **_TOOLS_FAILURE}
 
+    total_msgs_chars = sum(len(str(m)) for m in messages)
+    _caller = _get_caller()
+    logger.info(f"call_with_tools [{_caller}] system={len(system):,} messages={total_msgs_chars:,}chars (backend={_backend})")
     attempt = 0
     while attempt < MAX_RETRIES:
         try:
@@ -193,6 +215,8 @@ def call_simple(system: str, user: str, temperature: float = 0.3, **kwargs) -> s
     backend = kwargs.pop("backend", BACKEND)
 
     total_chars = len(system) + len(user)
+    _caller = _get_caller()
+    logger.info(f"call_simple [{_caller}] system={len(system):,} user={len(user):,} total={total_chars:,}chars (backend={backend})")
     if total_chars > MAX_CONTEXT_CHARS:
         allowed_user_chars = MAX_CONTEXT_CHARS - len(system)
         trimmed = len(user) - max(0, allowed_user_chars)

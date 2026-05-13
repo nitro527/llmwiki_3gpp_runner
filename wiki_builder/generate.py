@@ -214,7 +214,7 @@ def _generate_page(
             raw = call_llm(
                 GENERATOR_SYSTEM,
                 user_msg,
-                temperature=0.3,
+                temperature=0.1,
                 backend=backend,
             )
 

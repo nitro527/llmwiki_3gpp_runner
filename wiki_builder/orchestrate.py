@@ -416,6 +416,7 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
         "backend": args.backend,
         "max_workers": args.workers,
         "generate_failed": [],  # run_generate → run_evaluate 전달용
+        "generate_ran": False,  # 이번 세션에 run_generate 실행 여부
         "feature_list": _load_feature_list(),
     }
 
@@ -455,7 +456,7 @@ def _run_orchestrator(args, call_llm, user_message: str = None):
             elif name == "run_generate":
                 from wiki_builder.generate import run_generate
                 from wiki_builder.evaluate import run_evaluate
-from wiki_builder.quality import check_quality
+                from wiki_builder.quality import check_quality
                 plan = _load_plan()
                 if not plan:
                     return "[오류] plan.json 없음. run_plan을 먼저 실행하세요."
@@ -481,6 +482,7 @@ from wiki_builder.quality import check_quality
                     mid_eval_fn=_mid_eval_fn,
                 )
                 ctx["generate_failed"] = failed
+                ctx["generate_ran"] = True
                 return f"Generate 완료. 불합격: {len(failed)}개"
 
             elif name == "run_link":
@@ -504,6 +506,12 @@ from wiki_builder.quality import check_quality
                     return "[오류] plan.json 없음."
                 all_failed = list(ctx.get("generate_failed", []))
                 all_failed += ctx.get("generate_features_failed", [])
+                # generate가 이번 세션에 실행됐으면 [] 전달 (전체 재평가 스킵)
+                # generate가 실행되지 않았으면 None 전달 (전체 재평가)
+                if ctx.get("generate_ran"):
+                    initial_failed = all_failed  # 0개면 [] → 재평가 스킵
+                else:
+                    initial_failed = all_failed if all_failed else None
                 run_evaluate(
                     plan=plan,
                     wiki_dir=str(WIKI_DIR),
@@ -512,7 +520,7 @@ from wiki_builder.quality import check_quality
                     call_llm=ctx["call_llm"],
                     extract_spec_fn=extract_spec_content,
                     backend=ctx["backend"],
-                    initial_failed=all_failed if all_failed else None,
+                    initial_failed=initial_failed,
                 )
                 return "Evaluate 완료"
 

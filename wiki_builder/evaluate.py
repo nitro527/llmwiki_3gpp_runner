@@ -63,17 +63,22 @@ def run_evaluate(
     # - generate에서 바로 넘어온 경우: initial_failed 사용
     # - --phase evaluate 단독 실행: generated=True 페이지 재평가
     if initial_failed is not None:
+        # initial_failed=[] : 이번 세션 generate가 0개 불합격 → 재평가 불필요
+        # initial_failed=[...] : generate 불합격 목록 + 기존 페이지 재평가 병합
         from_generate = [
             {"path": fp["path"], "score": fp.get("score"), "issues": fp.get("issues", []),
              "reason": fp.get("reason", ""), "content": fp.get("content", "")}
             for fp in initial_failed
         ]
-        from_existing = _collect_failed_pages(pages, wiki_dir, extract_spec_fn, call_llm, backend)
-        # 중복 제거 (generate 불합격은 파일이 없으므로 from_existing에 안 들어오지만 방어적으로)
-        existing_paths = {fp["path"] for fp in from_existing}
-        merged = from_existing + [fp for fp in from_generate if fp["path"] not in existing_paths]
-        failed_pages = merged
-        logger.info(f"Generate 불합격 {len(from_generate)}개 + 기존 생성 불합격 {len(from_existing)}개 = 총 {len(failed_pages)}개")
+        if initial_failed:
+            from_existing = _collect_failed_pages(pages, wiki_dir, extract_spec_fn, call_llm, backend)
+            existing_paths = {fp["path"] for fp in from_existing}
+            merged = from_existing + [fp for fp in from_generate if fp["path"] not in existing_paths]
+            failed_pages = merged
+            logger.info(f"Generate 불합격 {len(from_generate)}개 + 기존 생성 불합격 {len(from_existing)}개 = 총 {len(failed_pages)}개")
+        else:
+            failed_pages = []
+            logger.info("Generate 불합격 0개 — 기존 페이지 재평가 스킵")
     else:
         failed_pages = _collect_failed_pages(pages, wiki_dir, extract_spec_fn, call_llm, backend)
 
@@ -557,7 +562,10 @@ def _format_failed_summary(failed_pages: list[dict]) -> str:
 
 
 def _parse_evaluator_response(raw: str) -> dict | None:
-    return extract_json_from_llm(raw)
+    result = extract_json_from_llm(raw)
+    if not isinstance(result, dict):
+        return None
+    return result
 
 
 def _hash_text(text: str) -> str:
